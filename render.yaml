@@ -1,0 +1,26 @@
+services:
+  - type: worker
+    name: ecopulse-bot
+    runtime: python
+    env: python
+    region: frankfurt # أو أي منطقة تختارها
+    plan: free # أو starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: SOURCE_CHANNEL
+        sync: false
+      - key: TARGET_CHANNEL
+        sync: false
+      - key: CONTROL_CHANNEL
+        sync: false
+      - key: OPENAI_API_KEYS
+        sync: false
+      - key: DRY_RUN
+        value: "0"

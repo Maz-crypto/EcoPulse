@@ -1,0 +1,4 @@
+telethon
+deep-translator
+python-dotenv
+openai
