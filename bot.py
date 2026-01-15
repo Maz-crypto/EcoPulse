@@ -67,6 +67,7 @@ EMOJI_SCHEDULED = "📝"
 EMOJI_ALERT = "⚠️🚨"
 EMOJI_HOURLY = "⏰"
 CHANNEL_WATERMARK = " "
+HOURLY_SIGNATURE = os.getenv("HOURLY_SIGNATURE", "— موجز الساعة")  # ← جديد
 
 # ---------------- التهيئة ----------------
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
@@ -731,7 +732,7 @@ async def generate_hourly_summary(manual=False):
                 {
                     "role": "system",
                     "content": (
-                        "أنت محرر اقتصادي محترف في عام 2026. "
+                        "أنت محرر اقتصادي محترف في عام 2026. حيث ترمب هو رئيس اميركا"
                         "لخص الأخبار التالية في موجز ساعة اقتصادي شامل بالعربية. "
                         "ركز على التأثيرات الرئيسية، المؤشرات، وتصريحات المسؤولين. "
                         "اجعله جذابًا ومختصرًا (لا يتجاوز 120 كلمة). "
@@ -750,7 +751,7 @@ async def generate_hourly_summary(manual=False):
             openai_manager.mark_failed(client_ai.api_key, error_str)
         summary = f"📊 **موجز الساعة الاقتصادية**\n\nفشل في التوليد. الأصل:\n```{combined_text[:300]}...```"
 
-    signature = os.getenv("SIGNATURE", "— EcoPulse")
+    signature = HOURLY_SIGNATURE
     final_text = f"{summary}\n\n{signature}\n\n{CHANNEL_WATERMARK}"[:4000]
 
     # إنشاء رسالة وهمية لاستخدامها في forward_or_send
@@ -865,3 +866,4 @@ if __name__ == "__main__":
         logging.info("🛑 تم إيقاف البوت يدوياً.")
     except Exception as e:
         logging.critical(f"💥 خطأ فادح: {e}", exc_info=True)
+
