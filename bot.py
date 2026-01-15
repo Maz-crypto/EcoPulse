@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-EcoPulse Bot — النسخة النهائية المستقرة
+EcoPulse Bot — النسخة النهائية المستقرة مع دعم موجز الساعة
 ✅ قناة تحكم ثابتة (من .env)
 ✅ جميع الأوامر تعمل فورًا
 ✅ استجابة تلقائية لأي رسالة غير معروفة
 ✅ كشف دقيق للبيانات الاقتصادية
 ✅ نشر فوري مشروط (600 مشاهدة أو 8 دقائق)
+✅ موجز ساعة اقتصادي تلقائي
 """
 
 import asyncio
@@ -13,7 +14,7 @@ import os
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 from collections import defaultdict
 
@@ -22,9 +23,6 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 from openai import OpenAI
-
-# ---------------- تحميل الإعدادات ----------------
-load_dotenv()
 
 # ---------------- تحميل الإعدادات ----------------
 load_dotenv()
@@ -44,11 +42,13 @@ TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "me")
 ANALYST_TARGET = os.getenv("ANALYST_TARGET", "")
 CONTROL_CHANNEL = os.getenv("CONTROL_CHANNEL", "me")
 ANALYST_SOURCE = os.getenv("ANALYST_SOURCE", "")
-
+HOURLY_SOURCE = os.getenv("HOURLY_SOURCE", "")  # ← جديد
+HOURLY_TARGET = os.getenv("HOURLY_TARGET", "")  # ← جديد
 
 ANALYST_SOURCE_ID = None
 ANALYST_TARGET_ID = None
-
+HOURLY_SOURCE_ID = None
+HOURLY_TARGET_ID = None
 
 # ---------------- إعدادات النشر ----------------
 IMMEDIATE_MIN_VIEWS = 600
@@ -65,11 +65,13 @@ KEYWORDS_LIST = ["JUST IN", "MACRO", "$MACRO", "marco", "FEDERAL", "POWELL", "po
 EMOJI_IMMEDIATE = "🚨"
 EMOJI_SCHEDULED = "📝"
 EMOJI_ALERT = "⚠️🚨"
+EMOJI_HOURLY = "⏰"
 CHANNEL_WATERMARK = " "
 
 # ---------------- التهيئة ----------------
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 translation_queue = deque()
+hourly_queue = deque()  # ← جديد: مكدس أخبار موجز الساعة
 posted_texts = set()
 MAX_POSTED_HISTORY = 100
 
@@ -79,6 +81,7 @@ publish_immediate = True      # النشر الفوري (غير الاقتصاد
 publish_economic = True       # البيانات الاقتصادية
 publish_analysis = True       # قناة التحليل
 publish_scheduled = True      # الناشر المجدول
+publish_hourly = True         # ← جديد: موجز الساعة
 dry_run_mode = os.getenv("DRY_RUN", "0").lower() in ("1", "true", "yes")
 
 # متغيرات التحكم في النشر الفوري
@@ -92,6 +95,7 @@ stats = {
     "immediate": 0,
     "scheduled": 0,
     "analysis": 0,
+    "hourly": 0,  # ← جديد
     "flood_waits": 0
 }
 
@@ -164,6 +168,8 @@ def log_activity(task: str, message_id: int):
         stats["scheduled"] += 1
     elif "تحليل" in task:
         stats["analysis"] += 1
+    elif "موجز" in task:
+        stats["hourly"] += 1
     stats["posts"] += 1
 
 def clean_text(text: str) -> str:
@@ -180,11 +186,9 @@ def is_meaningful_text(text: str) -> bool:
     """
     if not text:
         return False
-    # إزالة الروابط والرموز التعبيرية والمسافات الزائدة
     cleaned = re.sub(r"http\S+|www\.\S+", "", text)
-    cleaned = re.sub(r"[^\w\s\u0600-\u06FF]", "", cleaned)  # إبقاء الحروف العربية/اللاتينية والأرقام والمسافات
+    cleaned = re.sub(r"[^\w\s\u0600-\u06FF]", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    # التأكد من وجود كلمتين على الأقل (أو 10 أحرف على الأقل)
     return len(cleaned) >= 10 and len(cleaned.split()) >= 2
 
 # ---------------- حل معرفات القنوات ----------------
@@ -308,8 +312,8 @@ async def format_final_text(text: str, emoji: str, signature: str = None, attent
     cleaned = clean_text(text)
     if not is_meaningful_text(cleaned):
         logging.debug("🗑️ تم تجاهل نص غير ذي معنى في التنسيق")
-        return ""  # ← إرجاع سلسلة فارغة، وليس None
-    
+        return ""
+
     client_ai = openai_manager.get_client()
 
     if is_economic_data(text):
@@ -383,10 +387,10 @@ async def format_final_text(text: str, emoji: str, signature: str = None, attent
 
 # ---------------- إرسال الرسائل ----------------
 async def forward_or_send(message, caption: str, task_name="", target_channel=None):
-    if not caption or not caption.strip():  # ← تجاهل إذا كان فارغًا
+    if not caption or not caption.strip():
         logging.debug(f"❌ تجاهل نشر رسالة فارغة ID={message.id}")
         return None
-    # ... باقي الكود
+
     if not target_channel:
         target_channel = TARGET_CHANNEL_ID
 
@@ -416,7 +420,7 @@ async def forward_or_send(message, caption: str, task_name="", target_channel=No
 # ---------------- معالجة التحكم (مرتبطة بقناة التحكم الثابتة) ----------------
 @client.on(events.NewMessage(chats=[]))  # سيتم ربطها في main()
 async def control_handler(event):
-    global bot_active, publish_immediate, publish_economic, publish_analysis, publish_scheduled, dry_run_mode
+    global bot_active, publish_immediate, publish_economic, publish_analysis, publish_scheduled, publish_hourly, dry_run_mode
     
     raw_text = event.raw_text.strip()
     if not raw_text:
@@ -476,6 +480,24 @@ async def control_handler(event):
         logging.info("⛔ تم إيقاف الناشر المجدول.")
         await event.reply("⛔ تم إيقاف الناشر المجدول.")
     
+    # === التحكم بموجز الساعة ===
+    elif "موجز on" in text:
+        publish_hourly = True
+        logging.info("✅ تم تفعيل موجز الساعة.")
+        await event.reply("✅ تم تفعيل موجز الساعة.")
+    
+    elif "موجز off" in text:
+        publish_hourly = False
+        logging.info("⛔ تم إيقاف موجز الساعة.")
+        await event.reply("⛔ تم إيقاف موجز الساعة.")
+    
+    elif "موجز الآن" in text:
+        if not publish_hourly:
+            await event.reply("⚠️ موجز الساعة معطّل حاليًا. أرسل `موجز on` أولًا.")
+        else:
+            await generate_hourly_summary(manual=True)
+            await event.reply("✅ تم طلب إنشاء موجز الساعة يدويًا.")
+
     # === المراقبة ===
     elif "حالة" in text:
         status = (
@@ -485,7 +507,9 @@ async def control_handler(event):
             f"- اقتصادي: {'✅' if publish_economic else '⛔'}\n"
             f"- تحليل: {'✅' if publish_analysis else '⛔'}\n"
             f"- مجدول: {'✅' if publish_scheduled else '⛔'}\n"
-            f"- مكدس: {len(translation_queue)}\n"
+            f"- موجز ساعة: {'✅' if publish_hourly else '⛔'}\n"  # ← جديد
+            f"- مكدس عادي: {len(translation_queue)}\n"
+            f"- مكدس ساعة: {len(hourly_queue)}\n"
             f"- وضع تجربة: {'🧪' if dry_run_mode else '🚀'}"
         )
         await event.reply(status)
@@ -495,15 +519,17 @@ async def control_handler(event):
         await event.reply(f"🔧 **حالة مفاتيح OpenAI**\n\n{status}")
     
     elif "مكدس" in text:
-        count = len(translation_queue)
-        if count == 0:
-            await event.reply("📥 **المكدس**: فارغ")
-        else:
-            preview = "\n".join([
-                f"{i+1}. {item[0].message.message[:30]}..." 
-                for i, item in enumerate(list(translation_queue)[:5])
-            ])
-            await event.reply(f"📥 **المكدس**: {count} رسالة\n\n{preview}")
+        count1 = len(translation_queue)
+        count2 = len(hourly_queue)
+        msg = f"📥 **المكدس العادي**: {count1} رسالة\n"
+        msg += f"🕗 **مكدس موجز الساعة**: {count2} رسالة\n\n"
+        if count1 > 0:
+            preview1 = "\n".join([f"{i+1}. {item[0].message.message[:30]}..." for i, item in enumerate(list(translation_queue)[:3])])
+            msg += f"**العادي**:\n{preview1}\n\n"
+        if count2 > 0:
+            preview2 = "\n".join([f"{i+1}. {msg[:30]}..." for i, msg in enumerate(list(hourly_queue)[-3:])])
+            msg += f"**موجز الساعة**:\n{preview2}"
+        await event.reply(msg)
     
     elif "إحصاء" in text:
         await event.reply(
@@ -513,6 +539,7 @@ async def control_handler(event):
             f"- فوري: {stats['immediate']}\n"
             f"- مجدول: {stats['scheduled']}\n"
             f"- تحليل: {stats['analysis']}\n"
+            f"- موجز ساعة: {stats['hourly']}\n"  # ← جديد
             f"- تجميد: {stats['flood_waits']}"
         )
     
@@ -523,14 +550,18 @@ async def control_handler(event):
             f"- المصدر 2: `{SOURCE_CHANNEL_2_ID}`\n"
             f"- الهدف: `{TARGET_CHANNEL_ID}`\n"
             f"- تحليل: `{ANALYST_TARGET_ID or 'غير مفعل'}`\n"
+            f"- موجز مصدر: `{HOURLY_SOURCE_ID or 'غير مفعل'}`\n"
+            f"- موجز هدف: `{HOURLY_TARGET_ID or 'غير مفعل'}`\n"
             f"- التحكم: `{CONTROL_CHANNEL_ID}`"
         )
     
     # === الصيانة ===
     elif "مسح المخزن" in text:
-        count = len(translation_queue)
+        count1 = len(translation_queue)
+        count2 = len(hourly_queue)
         translation_queue.clear()
-        await event.reply(f"🧹 تم مسح {count} رسالة من المكدس.")
+        hourly_queue.clear()
+        await event.reply(f"🧹 تم مسح {count1 + count2} رسالة من المكدسين.")
     
     elif "إعادة تعيين" in text:
         before = len(posted_texts)
@@ -557,7 +588,9 @@ async def control_handler(event):
             "اقتصادي on/off\n"
             "نشر فوري on/off\n"
             "تحليل on/off\n"
-            "مجدول on/off\n\n"
+            "مجدول on/off\n"
+            "موجز on/off\n"
+            "موجز الآن\n\n"
             "# المراقبة\n"
             "حالة\n"
             "مفاتيح\n"
@@ -582,7 +615,9 @@ async def control_handler(event):
             "• `اقتصادي on` / `off`\n"
             "• `نشر فوري on` / `off`\n"
             "• `تحليل on` / `off`\n"
-            "• `مجدول on` / `off`\n\n"
+            "• `مجدول on` / `off`\n"
+            "• `موجز on` / `off`\n"
+            "• `موجز الآن`\n\n"
             "📌 أرسل **مساعدة** لعرض جميع الأوامر بالتفصيل."
         )
         await event.reply(quick_help)
@@ -613,7 +648,6 @@ async def handle_source(event, emoji):
         logging.info(f"🚫 تم تجاهل بيانات اقتصادية ID={message.id}")
         return
 
-
     # ✅ 2. النشر الفوري العادي
     text_lower = cleaned.lower()
     if publish_immediate and any(keyword.lower() in text_lower for keyword in KEYWORDS_LIST):
@@ -632,6 +666,20 @@ async def handle_source(event, emoji):
     # ✅ 3. الباقي
     translation_queue.append((event, emoji, None, None))
     logging.info(f"📥 أُضيفت الرسالة ID={message.id} للمكدس")
+
+# ---------------- معالجة مصدر موجز الساعة ----------------
+async def handle_hourly_source(event):
+    global bot_active, publish_hourly
+    if not bot_active or not publish_hourly:
+        return
+    message = event.message
+    if message.action:
+        return
+    text = message.message or ""
+    cleaned = clean_text(text)
+    if is_meaningful_text(cleaned):
+        hourly_queue.append(cleaned)
+        logging.info(f"🕗 أُضيفت رسالة إلى مكدس موجز الساعة ID={message.id}")
 
 # ---------------- القناة التحليلية ----------------
 ANALYST_POST_INTERVAL = 900
@@ -660,6 +708,71 @@ async def analyst_handler(event):
     
     if sent:
         analyst_last_post_time = current_time
+
+# ---------------- إنشاء موجز الساعة ----------------
+async def generate_hourly_summary(manual=False):
+    global publish_hourly
+    if not publish_hourly or not HOURLY_TARGET_ID:
+        return
+
+    if not hourly_queue:
+        logging.info("📭 مكدس موجز الساعة فارغ — لن يتم النشر.")
+        return
+
+    # جمع جميع الأخبار في نص واحد
+    combined_text = "\n".join(hourly_queue)
+    hourly_queue.clear()  # تفريغ المكدس
+
+    client_ai = openai_manager.get_client()
+    try:
+        response = client_ai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "أنت محرر اقتصادي محترف في عام 2026. "
+                        "لخص الأخبار التالية في موجز ساعة اقتصادي شامل بالعربية. "
+                        "ركز على التأثيرات الرئيسية، المؤشرات، وتصريحات المسؤولين. "
+                        "اجعله جذابًا ومختصرًا (لا يتجاوز 120 كلمة). "
+                        "ابدأ بعنوان جذاب مثل: '📊 موجز الساعة الاقتصادية'."
+                    ),
+                },
+                {"role": "user", "content": combined_text},
+            ],
+            temperature=0.6,
+        )
+        summary = response.choices[0].message.content.strip()
+    except Exception as e:
+        error_str = str(e)
+        logging.warning(f"⚠️ فشل في إنشاء موجز الساعة: {error_str[:100]}...")
+        if hasattr(client_ai, 'api_key'):
+            openai_manager.mark_failed(client_ai.api_key, error_str)
+        summary = f"📊 **موجز الساعة الاقتصادية**\n\nفشل في التوليد. الأصل:\n```{combined_text[:300]}...```"
+
+    signature = os.getenv("SIGNATURE", "— EcoPulse")
+    final_text = f"{summary}\n\n{signature}\n\n{CHANNEL_WATERMARK}"[:4000]
+
+    # إنشاء رسالة وهمية لاستخدامها في forward_or_send
+    class FakeMessage:
+        id = int(time.time())
+    fake_msg = FakeMessage()
+
+    sent = await forward_or_send(fake_msg, final_text, "نشر موجز ساعة", target_channel=HOURLY_TARGET_ID)
+    if sent:
+        logging.info("✅ تم نشر موجز الساعة بنجاح.")
+
+# ---------------- جدولة موجز الساعة ----------------
+async def hourly_scheduler():
+    """ينشر موجز الساعة كل ساعة عند الدقيقة 00."""
+    while True:
+        now = datetime.now()
+        next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        sleep_seconds = (next_hour - now).total_seconds()
+        logging.info(f"😴 سينتظر {sleep_seconds:.0f} ثانية حتى موجز الساعة التالي ({next_hour.strftime('%H:%M')}).")
+        await asyncio.sleep(sleep_seconds)
+        if bot_active and publish_hourly:
+            await generate_hourly_summary()
 
 # ---------------- النشر المجدول ----------------
 async def publisher():
@@ -693,7 +806,7 @@ async def publisher():
 
 # ---------------- التشغيل ----------------
 async def main():
-    global SOURCE_CHANNEL_ID, SOURCE_CHANNEL_2_ID, TARGET_CHANNEL_ID, ANALYST_TARGET_ID, ANALYST_SOURCE_ID, CONTROL_CHANNEL_ID
+    global SOURCE_CHANNEL_ID, SOURCE_CHANNEL_2_ID, TARGET_CHANNEL_ID, ANALYST_TARGET_ID, ANALYST_SOURCE_ID, CONTROL_CHANNEL_ID, HOURLY_SOURCE_ID, HOURLY_TARGET_ID
     
     await client.start()
     me = await client.get_me()
@@ -707,10 +820,12 @@ async def main():
         TARGET_CHANNEL_ID = await resolve_channel(TARGET_CHANNEL)
         if ANALYST_SOURCE:
             ANALYST_SOURCE_ID = await resolve_channel(ANALYST_SOURCE)
-
         if ANALYST_TARGET:
             ANALYST_TARGET_ID = await resolve_channel(ANALYST_TARGET)
-
+        if HOURLY_SOURCE:
+            HOURLY_SOURCE_ID = await resolve_channel(HOURLY_SOURCE)
+        if HOURLY_TARGET:
+            HOURLY_TARGET_ID = await resolve_channel(HOURLY_TARGET)
         
         logging.info(f"✅ القنوات جاهزة: تحكم={CONTROL_CHANNEL_ID}")
     except Exception as e:
@@ -730,10 +845,18 @@ async def main():
             analyst_handler,
             events.NewMessage(chats=[ANALYST_SOURCE_ID])
         )
-
     
+    # ✅ ربط مصدر موجز الساعة
+    if HOURLY_SOURCE_ID:
+        client.add_event_handler(handle_hourly_source, events.NewMessage(chats=[HOURLY_SOURCE_ID]))
+
     logging.info("🤖 EcoPulse Bot جاهز — في انتظار الأوامر في قناة التحكم.")
-    await asyncio.gather(publisher(), client.run_until_disconnected())
+    # تشغيل الجدولة والمراقبة بالتوازي
+    await asyncio.gather(
+        publisher(),
+        hourly_scheduler(),
+        client.run_until_disconnected()
+    )
 
 if __name__ == "__main__":
     try:
@@ -741,5 +864,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("🛑 تم إيقاف البوت يدوياً.")
     except Exception as e:
-
         logging.critical(f"💥 خطأ فادح: {e}", exc_info=True)
