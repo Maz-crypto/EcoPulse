@@ -273,7 +273,7 @@ async def analyze_and_translate(text: str, target_lang: str, max_retries: int = 
         try:
             response = client_ai.chat.completions.create(
                # model="gpt-4o-mini",
-                model="gpt-5.2",
+                model="gpt-5-nano",
                 messages=[
                     {
                         "role": "system",
@@ -322,7 +322,7 @@ async def format_final_text(text: str, emoji: str, signature: str = None, attent
         logging.info("📡 كشف بيانات اقتصادية")
         try:
             response = client_ai.chat.completions.create(
-                model="gpt-5.2",
+                model="gpt-5-nano",
                 messages=[
                     {
                         "role": "system",
@@ -728,7 +728,7 @@ async def generate_hourly_summary(manual=False):
     client_ai = openai_manager.get_client()
     try:
         response = client_ai.chat.completions.create(
-            model="gpt-5.2",
+            model="gpt-5-nano",
             messages=[
                 {
                     "role": "system",
@@ -867,5 +867,6 @@ if __name__ == "__main__":
         logging.info("🛑 تم إيقاف البوت يدوياً.")
     except Exception as e:
         logging.critical(f"💥 خطأ فادح: {e}", exc_info=True)
+
 
 
