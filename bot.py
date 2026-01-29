@@ -282,11 +282,11 @@ async def analyze_and_translate(text: str, target_lang: str, max_retries: int = 
                             "حلّل الخبر، ثم أعد صياغته بالعربية بأسلوب اقتصادي مختصر. "
                             "أولاً، قدم تقييمًا للتأثير من كلمتين إلى أربع. "
                             "ثم ضع ### ثم أعد الصياغة بالعربية."
-                        ),
+                        )
                     },
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.3,
+                    {"role": "user", "content": text}
+                ]
+                #temperature=0.3,
             )
 
             content = response.choices[0].message.content.strip()
@@ -336,11 +336,11 @@ async def format_final_text(text: str, emoji: str, signature: str = None, attent
                             "🕒 التقدير :\n"
                             "🕓 الحالي :\n\n"
                             "👈 النتيجة : تحليل ≤ 9 كلمات."
-                        ),
+                        )
                     },
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.5,
+                    {"role": "user", "content": text}
+                ]
+                #temperature=0.5,
             )
             translation = response.choices[0].message.content.strip()
         except Exception as e:
@@ -357,17 +357,17 @@ async def format_final_text(text: str, emoji: str, signature: str = None, attent
     elif "MACRO" in text.upper():
         try:
             response = client_ai.chat.completions.create(
-                model="gpt-5.2",
+                model="gpt-5-nano",
                 messages=[
                     {
                         "role": "system",
                         "content": (
                             "أنت محلل اقتصادي حيث ترامب هو الرئيس الحالي لامريكا. قم بتحليل الخبر بالعربية ≤ 10 كلمات."
-                        ),
+                        )
                     },
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.7,
+                    {"role": "user", "content": text}
+                ]
+                #temperature=0.7,
             )
             translation = response.choices[0].message.content.strip()
         except Exception as e:
@@ -738,11 +738,11 @@ async def generate_hourly_summary(manual=False):
                         "ركز على التأثيرات الرئيسية، المؤشرات، وتصريحات المسؤولين. "
                         "اجعله جذابًا ومختصرًا (لا يتجاوز 120 كلمة). "
                         "ابدأ بعنوان جذاب مثل: '📊 موجز الساعة الاقتصادية'."
-                    ),
+                    )
                 },
-                {"role": "user", "content": combined_text},
-            ],
-            temperature=0.6,
+                {"role": "user", "content": combined_text}
+            ]
+            #temperature=0.6,
         )
         summary = response.choices[0].message.content.strip()
     except Exception as e:
@@ -867,6 +867,7 @@ if __name__ == "__main__":
         logging.info("🛑 تم إيقاف البوت يدوياً.")
     except Exception as e:
         logging.critical(f"💥 خطأ فادح: {e}", exc_info=True)
+
 
 
 
