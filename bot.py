@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-EcoPulse Bot — النسخة النهائية المستقرة مع دعم موجز الساعة
+EcoPulse Bot — النسخة النهائية المستقرة مع دعم موجز الساعة وGemini الاحتياطي
 ✅ قناة تحكم ثابتة (من .env)
 ✅ جميع الأوامر تعمل فورًا
 ✅ استجابة تلقائية لأي رسالة غير معروفة
 ✅ كشف دقيق للبيانات الاقتصادية
 ✅ نشر فوري مشروط (600 مشاهدة أو 8 دقائق)
 ✅ موجز ساعة اقتصادي تلقائي
+✅ دعم OpenAI + Gemini (احتياطي تلقائي)
 """
 
 import asyncio
@@ -23,6 +24,7 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 from openai import OpenAI
+import google.generativeai as genai
 
 # ---------------- تحميل الإعدادات ----------------
 load_dotenv()
@@ -42,8 +44,8 @@ TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "me")
 ANALYST_TARGET = os.getenv("ANALYST_TARGET", "")
 CONTROL_CHANNEL = os.getenv("CONTROL_CHANNEL", "me")
 ANALYST_SOURCE = os.getenv("ANALYST_SOURCE", "")
-HOURLY_SOURCE = os.getenv("HOURLY_SOURCE", "")  # ← جديد
-HOURLY_TARGET = os.getenv("HOURLY_TARGET", "")  # ← جديد
+HOURLY_SOURCE = os.getenv("HOURLY_SOURCE", "")
+HOURLY_TARGET = os.getenv("HOURLY_TARGET", "")
 
 ANALYST_SOURCE_ID = None
 ANALYST_TARGET_ID = None
@@ -55,10 +57,17 @@ IMMEDIATE_MIN_VIEWS = 600
 IMMEDIATE_TIMEOUT = 8 * 60
 MIN_VIEWS_FOR_NEXT = int(os.getenv("MIN_VIEWS_FOR_NEXT", "800"))
 
-# ---------------- مفاتيح OpenAI ----------------
-API_KEYS = os.getenv("OPENAI_API_KEYS", "").split(",")
-if not API_KEYS or API_KEYS == [""]:
-    raise ValueError("❌ لم يتم العثور على مفاتيح OpenAI في ملف .env")
+# ---------------- مفاتيح الذكاء الاصطناعي ----------------
+OPENAI_KEYS = os.getenv("OPENAI_API_KEYS", "").split(",")
+GEMINI_KEYS = os.getenv("GEMINI_API_KEYS", "").split(",")
+
+if not OPENAI_KEYS or OPENAI_KEYS == [""]:
+    logging.warning("⚠️ لم يتم العثور على مفاتيح OpenAI في ملف .env")
+if not GEMINI_KEYS or GEMINI_KEYS == [""]:
+    logging.warning("⚠️ لم يتم العثور على مفاتيح Gemini في ملف .env")
+
+if not OPENAI_KEYS and not GEMINI_KEYS:
+    raise ValueError("❌ لا توجد مفاتيح OpenAI أو Gemini صالحة في ملف .env")
 
 # ---------------- إعدادات عامة ----------------
 KEYWORDS_LIST = ["JUST IN", "MACRO", "$MACRO", "marco", "FEDERAL", "POWELL", "powell", "TRUMP", "FED'S", "FED", "🔴"]
@@ -67,22 +76,22 @@ EMOJI_SCHEDULED = "📝"
 EMOJI_ALERT = "⚠️🚨"
 EMOJI_HOURLY = "⏰"
 CHANNEL_WATERMARK = " "
-HOURLY_SIGNATURE = os.getenv("HOURLY_SIGNATURE", "— موجز الساعة")  # ← جديد
+HOURLY_SIGNATURE = os.getenv("HOURLY_SIGNATURE", "— موجز الساعة")
 
 # ---------------- التهيئة ----------------
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 translation_queue = deque()
-hourly_queue = deque()  # ← جديد: مكدس أخبار موجز الساعة
+hourly_queue = deque()
 posted_texts = set()
 MAX_POSTED_HISTORY = 100
 
 # === متغيرات التحكم ===
 bot_active = False
-publish_immediate = True      # النشر الفوري (غير الاقتصادي)
-publish_economic = True       # البيانات الاقتصادية
-publish_analysis = True       # قناة التحليل
-publish_scheduled = True      # الناشر المجدول
-publish_hourly = True         # ← جديد: موجز الساعة
+publish_immediate = True
+publish_economic = True
+publish_analysis = True
+publish_scheduled = True
+publish_hourly = True
 dry_run_mode = os.getenv("DRY_RUN", "0").lower() in ("1", "true", "yes")
 
 # متغيرات التحكم في النشر الفوري
@@ -96,8 +105,10 @@ stats = {
     "immediate": 0,
     "scheduled": 0,
     "analysis": 0,
-    "hourly": 0,  # ← جديد
-    "flood_waits": 0
+    "hourly": 0,
+    "flood_waits": 0,
+    "openai_usage": 0,
+    "gemini_usage": 0
 }
 
 logging.basicConfig(
@@ -106,56 +117,85 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(), logging.FileHandler("bot_activity.log", "a", encoding="utf-8")]
 )
 
-# ---------------- إدارة مفاتيح OpenAI ----------------
-class OpenAIManager:
-    def __init__(self, keys):
-        self.keys = [k.strip() for k in keys if k.strip()]
-        if not self.keys:
-            raise ValueError("❌ لا توجد مفاتيح OpenAI صالحة")
-        self.index = 0
-        self.failed_keys = {}
+# ---------------- إدارة مفاتيح الذكاء الاصطناعي ----------------
+class AIManager:
+    def __init__(self, openai_keys, gemini_keys):
+        self.openai_keys = [k.strip() for k in openai_keys if k.strip()]
+        self.gemini_keys = [k.strip() for k in gemini_keys if k.strip()]
+        self.openai_index = 0
+        self.gemini_index = 0
+        self.failed_openai = {}
+        self.failed_gemini = {}
         self.failure_cooldown = 3600
-        self.usage_stats = defaultdict(int)
-        logging.info(f"Intialized OpenAIManager with {len(self.keys)} keys")
+        self.usage_stats = {"openai": defaultdict(int), "gemini": defaultdict(int)}
+        logging.info(f"Intialized AIManager with {len(self.openai_keys)} OpenAI keys and {len(self.gemini_keys)} Gemini keys")
 
-    def _get_usable_keys(self):
+    def _get_usable_keys(self, key_type):
         now = time.time()
+        if key_type == "openai":
+            keys = self.openai_keys
+            failed = self.failed_openai
+        else:
+            keys = self.gemini_keys
+            failed = self.failed_gemini
         usable = []
-        for key in self.keys:
-            fail_time = self.failed_keys.get(key)
+        for key in keys:
+            fail_time = failed.get(key)
             if not fail_time or (now - fail_time) > self.failure_cooldown:
                 usable.append(key)
         return usable
 
-    def get_client(self):
-        usable_keys = self._get_usable_keys()
+    def get_openai_client(self):
+        usable_keys = self._get_usable_keys("openai")
         if not usable_keys:
-            logging.warning("⚠️ جميع المفاتيح معطّلة — إعادة تفعيل الجميع")
-            self.failed_keys.clear()
-            usable_keys = self.keys
-
-        key = usable_keys[self.index % len(usable_keys)]
-        self.index += 1
-        self.usage_stats[key] += 1
-        logging.debug(f"🔑 استخدام مفتاح: {key[:5]}... (الاستخدام: {self.usage_stats[key]})")
+            logging.warning("⚠️ جميع مفاتيح OpenAI معطّلة")
+            return None
+        key = usable_keys[self.openai_index % len(usable_keys)]
+        self.openai_index += 1
+        self.usage_stats["openai"][key] += 1
+        logging.debug(f"🔑 استخدام مفتاح OpenAI: {key[:5]}... (الاستخدام: {self.usage_stats['openai'][key]})")
         return OpenAI(api_key=key)
 
-    def mark_failed(self, key: str, error: str = ""):
-        self.failed_keys[key] = time.time()
-        logging.warning(f"🚫 مفتاح معطّل: {key[:5]}... — {error}")
-        usable = self._get_usable_keys()
-        logging.info(f"📊 حالة المفاتيح: {len(usable)}/{len(self.keys)} نشطة")
+    def get_gemini_client(self):
+        usable_keys = self._get_usable_keys("gemini")
+        if not usable_keys:
+            logging.warning("⚠️ جميع مفاتيح Gemini معطّلة")
+            return None
+        key = usable_keys[self.gemini_index % len(usable_keys)]
+        self.gemini_index += 1
+        self.usage_stats["gemini"][key] += 1
+        logging.debug(f"🔑 استخدام مفتاح Gemini: {key[:5]}... (الاستخدام: {self.usage_stats['gemini'][key]})")
+        genai.configure(api_key=key)
+        return genai.GenerativeModel('gemini-pro')
+
+    def mark_openai_failed(self, key: str, error: str = ""):
+        self.failed_openai[key] = time.time()
+        logging.warning(f"🚫 مفتاح OpenAI معطّل: {key[:5]}... — {error}")
+        usable = self._get_usable_keys("openai")
+        logging.info(f"📊 حالة مفاتيح OpenAI: {len(usable)}/{len(self.openai_keys)} نشطة")
+
+    def mark_gemini_failed(self, key: str, error: str = ""):
+        self.failed_gemini[key] = time.time()
+        logging.warning(f"🚫 مفتاح Gemini معطّل: {key[:5]}... — {error}")
+        usable = self._get_usable_keys("gemini")
+        logging.info(f"📊 حالة مفاتيح Gemini: {len(usable)}/{len(self.gemini_keys)} نشطة")
 
     def get_status(self) -> str:
-        usable = self._get_usable_keys()
-        failed = [k for k in self.keys if k not in usable]
-        return (
-            f"🔑 المفاتيح: {len(self.keys)} | نشطة: {len(usable)} | معطّلة: {len(failed)}\n"
-            f"📈 الاستخدام: {dict(self.usage_stats)}\n"
-            f"❌ المعطّلة: {[k[:5]+'...' for k in failed]}"
+        openai_usable = self._get_usable_keys("openai")
+        gemini_usable = self._get_usable_keys("gemini")
+        openai_failed = [k for k in self.openai_keys if k not in openai_usable]
+        gemini_failed = [k for k in self.gemini_keys if k not in gemini_usable]
+        status = (
+            f"🔑 OpenAI: {len(self.openai_keys)} | نشطة: {len(openai_usable)} | معطّلة: {len(openai_failed)}\n"
+            f"🔑 Gemini: {len(self.gemini_keys)} | نشطة: {len(gemini_usable)} | معطّلة: {len(gemini_failed)}\n"
+            f"📈 OpenAI الاستخدام: {dict(self.usage_stats['openai'])}\n"
+            f"📈 Gemini الاستخدام: {dict(self.usage_stats['gemini'])}\n"
+            f"❌ OpenAI المعطّلة: {[k[:5]+'...' for k in openai_failed]}\n"
+            f"❌ Gemini المعطّلة: {[k[:5]+'...' for k in gemini_failed]}"
         )
+        return status
 
-openai_manager = OpenAIManager(API_KEYS)
+ai_manager = AIManager(OPENAI_KEYS, GEMINI_KEYS)
 
 # ---------------- أدوات مساعدة ----------------
 def log_activity(task: str, message_id: int):
@@ -182,9 +222,6 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 def is_meaningful_text(text: str) -> bool:
-    """
-    يتحقق مما إذا كان النص يحتوي على محتوى ذي معنى (ليس فقط روابط، رموز، أو فراغات).
-    """
     if not text:
         return False
     cleaned = re.sub(r"http\S+|www\.\S+", "", text)
@@ -262,49 +299,90 @@ TARGET_CHANNEL_ID = None
 ANALYST_TARGET_ID = None
 CONTROL_CHANNEL_ID = None
 
+# ---------------- وظائف معالجة الذكاء الاصطناعي ----------------
+async def call_openai(prompt: str, user_content: str, max_retries=3):
+    """استدعاء OpenAI باستخدام gpt-4o-mini"""
+    for attempt in range(max_retries):
+        client_ai = ai_manager.get_openai_client()
+        if not client_ai:
+            return None
+            
+        try:
+            response = client_ai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                timeout=15.0
+            )
+            stats["openai_usage"] += 1
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            error_str = str(e)
+            logging.warning(f"❌ فشل OpenAI (محاولة {attempt + 1}): {error_str[:100]}...")
+            ai_manager.mark_openai_failed(client_ai.api_key, error_str)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+    return None
+
+async def call_gemini(prompt: str, user_content: str, max_retries=3):
+    """استدعاء Gemini باستخدام gemini-pro"""
+    for attempt in range(max_retries):
+        model = ai_manager.get_gemini_client()
+        if not model:
+            return None
+            
+        try:
+            full_prompt = f"{prompt}\n\nالمحتوى: {user_content}"
+            response = await model.generate_content_async(full_prompt)
+            stats["gemini_usage"] += 1
+            return response.text.strip()
+        except Exception as e:
+            error_str = str(e)
+            logging.warning(f"❌ فشل Gemini (محاولة {attempt + 1}): {error_str[:100]}...")
+            if ai_manager.gemini_keys:
+                current_key = ai_manager.gemini_keys[(ai_manager.gemini_index - 1) % len(ai_manager.gemini_keys)]
+                ai_manager.mark_gemini_failed(current_key, error_str)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+    return None
+
+async def call_ai_with_fallback(prompt: str, user_content: str) -> str:
+    """استدعاء OpenAI أولاً، ثم Gemini كخيار احتياطي"""
+    result = await call_openai(prompt, user_content)
+    if result is not None:
+        return result
+        
+    logging.info("🔄 التبديل إلى Gemini بسبب فشل OpenAI")
+    result = await call_gemini(prompt, user_content)
+    if result is not None:
+        return result
+        
+    logging.error("💥 فشل كل من OpenAI وGemini في معالجة الطلب")
+    return user_content
+
 # ---------------- تحليل وترجمة ----------------
 async def analyze_and_translate(text: str, target_lang: str, max_retries: int = 6, retry_delay: int = 5) -> dict:
     if not text:
         return {"impact": "⚪ تأثير محايد", "translation": ""}
 
-    attempt = 0
-    while attempt < max_retries:
-        client_ai = openai_manager.get_client()
-        try:
-            response = client_ai.chat.completions.create(
-               # model="gpt-4o-mini",
-                model="gpt-5-nano",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "أنت محلل اقتصادي ومترجم محترف في عام 2026 حيث ترامب هو رئيس امريكا. "
-                            "حلّل الخبر، ثم أعد صياغته بالعربية بأسلوب اقتصادي مختصر. "
-                            "أولاً، قدم تقييمًا للتأثير من كلمتين إلى أربع. "
-                            "ثم ضع ### ثم أعد الصياغة بالعربية."
-                        )
-                    },
-                    {"role": "user", "content": text}
-                ]
-                #temperature=0.3,
-            )
-
-            content = response.choices[0].message.content.strip()
-            parts = content.split("###", 1)
-            impact = parts[0].strip() if parts else "⚪ تأثير محايد"
-            translation = parts[1].strip() if len(parts) > 1 else text
-            return {"impact": impact, "translation": translation}
-        except Exception as e:
-            error_str = str(e)
-            logging.warning(f"❌ محاولة {attempt + 1} فشلت: {error_str[:100]}...")
-            if 'client_ai' in locals() and hasattr(client_ai, 'api_key'):
-                openai_manager.mark_failed(client_ai.api_key, error_str)
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay)
-            else:
-                logging.error("⚠️ فشل التحليل بعد جميع المحاولات.")
-                return {"impact": "⚪ تأثير محايد", "translation": text}
-            attempt += 1
+    system_prompt = (
+        "أنت محلل اقتصادي ومترجم محترف في عام 2026 حيث ترامب هو رئيس امريكا. "
+        "حلّل الخبر، ثم أعد صياغته بالعربية بأسلوب اقتصادي مختصر. "
+        "أولاً، قدم تقييمًا للتأثير من كلمتين إلى أربع. "
+        "ثم ضع ### ثم أعد الصياغة بالعربية."
+    )
+    
+    content = await call_ai_with_fallback(system_prompt, text)
+    
+    if content:
+        parts = content.split("###", 1)
+        impact = parts[0].strip() if parts else "⚪ تأثير محايد"
+        translation = parts[1].strip() if len(parts) > 1 else text
+        return {"impact": impact, "translation": translation}
+    else:
+        return {"impact": "⚪ تأثير محايد", "translation": text}
 
 # ---------------- تنسيق المنشور ----------------
 async def format_final_text(text: str, emoji: str, signature: str = None, attention=False) -> str:
@@ -316,68 +394,32 @@ async def format_final_text(text: str, emoji: str, signature: str = None, attent
         logging.debug("🗑️ تم تجاهل نص غير ذي معنى في التنسيق")
         return ""
 
-    client_ai = openai_manager.get_client()
-
     if is_economic_data(text):
         logging.info("📡 كشف بيانات اقتصادية")
-        try:
-            response = client_ai.chat.completions.create(
-                model="gpt-5-nano",
-                messages=[
-                    {
-                        "role": "system",
-                        "content":(
-                            "أنت محرر أخبار اقتصادية محترف. "
-                            "استخرج البيانات واعرضها بالقالب:\n"
-                            "🔴 صدر الآن :\n\n"
-                            "💠 {الدولة}\n"
-                            "🔵 {المؤشر}\n\n"
-                            "🕒 السابق :\n"
-                            "🕒 التقدير :\n"
-                            "🕓 الحالي :\n\n"
-                            "👈 النتيجة : تحليل ≤ 9 كلمات."
-                        )
-                    },
-                    {"role": "user", "content": text}
-                ]
-                #temperature=0.5,
-            )
-            translation = response.choices[0].message.content.strip()
-        except Exception as e:
-            error_str = str(e)
-            logging.warning(f"⚠️ فشل في معالجة ACTUAL: {error_str[:100]}...")
-            if 'client_ai' in locals() and hasattr(client_ai, 'api_key'):
-                openai_manager.mark_failed(client_ai.api_key, error_str)
+        system_prompt = (
+            "أنت محرر أخبار اقتصادية محترف. "
+            "استخرج البيانات واعرضها بالقالب:\n"
+            "🔴 صدر الآن :\n\n"
+            "💠 {الدولة}\n"
+            "🔵 {المؤشر}\n\n"
+            "🕒 السابق :\n"
+            "🕒 التقدير :\n"
+            "🕓 الحالي :\n\n"
+            "👈 النتيجة : تحليل ≤ 9 كلمات."
+        )
+        translation = await call_ai_with_fallback(system_prompt, text)
+        if not translation:
             fallback = f"🔴 **بيانات اقتصادية**\n\n```{clean_text(text)[:200]}...```\n\n{signature}"
             return fallback
-
         final_text = f"{translation}\n\n{signature}\n\n{CHANNEL_WATERMARK}"
         return final_text[:4000]
 
     elif "MACRO" in text.upper():
-        try:
-            response = client_ai.chat.completions.create(
-                model="gpt-5-nano",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "أنت محلل اقتصادي حيث ترامب هو الرئيس الحالي لامريكا. قم بتحليل الخبر بالعربية ≤ 10 كلمات."
-                        )
-                    },
-                    {"role": "user", "content": text}
-                ]
-                #temperature=0.7,
-            )
-            translation = response.choices[0].message.content.strip()
-        except Exception as e:
-            error_str = str(e)
-            logging.warning(f"⚠️ فشل في التحليل (MACRO): {error_str[:100]}...")
-            if 'client_ai' in locals() and hasattr(client_ai, 'api_key'):
-                openai_manager.mark_failed(client_ai.api_key, error_str)
+        system_prompt = "أنت محلل اقتصادي حيث ترامب هو الرئيس الحالي لامريكا. قم بتحليل الخبر بالعربية ≤ 10 كلمات."
+        translation = await call_ai_with_fallback(system_prompt, text)
+        if not translation:
             fallback = f"💡 **تحليل اقتصادي**\n\n```{clean_text(text)[:150]}...```\n\n{signature}"
             return fallback
-
         final_text = f"{translation}\n\n{signature}\n\n{CHANNEL_WATERMARK}"
         return final_text[:4000]
 
@@ -420,7 +462,7 @@ async def forward_or_send(message, caption: str, task_name="", target_channel=No
         logging.exception("Error while sending message")
 
 # ---------------- معالجة التحكم (مرتبطة بقناة التحكم الثابتة) ----------------
-@client.on(events.NewMessage(chats=[]))  # سيتم ربطها في main()
+@client.on(events.NewMessage(chats=[]))
 async def control_handler(event):
     global bot_active, publish_immediate, publish_economic, publish_analysis, publish_scheduled, publish_hourly, dry_run_mode
     
@@ -430,77 +472,60 @@ async def control_handler(event):
     
     text = raw_text
     
-    # === التحكم العام ===
     if "تفعيل" in text:
         bot_active = True
         logging.info("✅ تم تفعيل البوت كاملاً.")
         await event.reply("✅ تم تفعيل البوت كاملاً.")
-    
     elif "ايقاف" in text:
         bot_active = False
         logging.info("⛔ تم إيقاف البوت كاملاً.")
         await event.reply("⛔ تم إيقاف البوت كاملاً.")
-    
-    # === التحكم الجزئي ===
     elif "نشر فوري on" in text:
         publish_immediate = True
         logging.info("✅ تم تفعيل النشر الفوري (غير الاقتصادي).")
         await event.reply("✅ تم تفعيل النشر الفوري (غير الاقتصادي).")
-    
     elif "نشر فوري off" in text:
         publish_immediate = False
         logging.info("⛔ تم إيقاف النشر الفوري (غير الاقتصادي).")
         await event.reply("⛔ تم إيقاف النشر الفوري (غير الاقتصادي).")
-    
     elif "اقتصادي on" in text:
         publish_economic = True
         logging.info("✅ تم تفعيل معالجة البيانات الاقتصادية.")
         await event.reply("✅ تم تفعيل معالجة البيانات الاقتصادية.")
-    
     elif "اقتصادي off" in text:
         publish_economic = False
         logging.info("⛔ تم إيقاف معالجة البيانات الاقتصادية.")
         await event.reply("⛔ تم إيقاف معالجة البيانات الاقتصادية.")
-    
     elif "تحليل on" in text:
         publish_analysis = True
         logging.info("✅ تم تفعيل قناة التحليل.")
         await event.reply("✅ تم تفعيل قناة التحليل.")
-    
     elif "تحليل off" in text:
         publish_analysis = False
         logging.info("⛔ تم إيقاف قناة التحليل.")
         await event.reply("⛔ تم إيقاف قناة التحليل.")
-    
     elif "مجدول on" in text:
         publish_scheduled = True
         logging.info("✅ تم تفعيل الناشر المجدول.")
         await event.reply("✅ تم تفعيل الناشر المجدول.")
-    
     elif "مجدول off" in text:
         publish_scheduled = False
         logging.info("⛔ تم إيقاف الناشر المجدول.")
         await event.reply("⛔ تم إيقاف الناشر المجدول.")
-    
-    # === التحكم بموجز الساعة ===
     elif "موجز on" in text:
         publish_hourly = True
         logging.info("✅ تم تفعيل موجز الساعة.")
         await event.reply("✅ تم تفعيل موجز الساعة.")
-    
     elif "موجز off" in text:
         publish_hourly = False
         logging.info("⛔ تم إيقاف موجز الساعة.")
         await event.reply("⛔ تم إيقاف موجز الساعة.")
-    
     elif "موجز الآن" in text:
         if not publish_hourly:
             await event.reply("⚠️ موجز الساعة معطّل حاليًا. أرسل `موجز on` أولًا.")
         else:
             await generate_hourly_summary(manual=True)
             await event.reply("✅ تم طلب إنشاء موجز الساعة يدويًا.")
-
-    # === المراقبة ===
     elif "حالة" in text:
         status = (
             f"📊 **حالة البوت**\n"
@@ -509,17 +534,15 @@ async def control_handler(event):
             f"- اقتصادي: {'✅' if publish_economic else '⛔'}\n"
             f"- تحليل: {'✅' if publish_analysis else '⛔'}\n"
             f"- مجدول: {'✅' if publish_scheduled else '⛔'}\n"
-            f"- موجز ساعة: {'✅' if publish_hourly else '⛔'}\n"  # ← جديد
+            f"- موجز ساعة: {'✅' if publish_hourly else '⛔'}\n"
             f"- مكدس عادي: {len(translation_queue)}\n"
             f"- مكدس ساعة: {len(hourly_queue)}\n"
             f"- وضع تجربة: {'🧪' if dry_run_mode else '🚀'}"
         )
         await event.reply(status)
-    
     elif "مفاتيح" in text:
-        status = openai_manager.get_status()
-        await event.reply(f"🔧 **حالة مفاتيح OpenAI**\n\n{status}")
-    
+        status = ai_manager.get_status()
+        await event.reply(f"🔧 **حالة مفاتيح الذكاء الاصطناعي**\n\n{status}")
     elif "مكدس" in text:
         count1 = len(translation_queue)
         count2 = len(hourly_queue)
@@ -532,7 +555,6 @@ async def control_handler(event):
             preview2 = "\n".join([f"{i+1}. {msg[:30]}..." for i, msg in enumerate(list(hourly_queue)[-3:])])
             msg += f"**موجز الساعة**:\n{preview2}"
         await event.reply(msg)
-    
     elif "إحصاء" in text:
         await event.reply(
             f"📈 **إحصاءات النشر**\n"
@@ -541,10 +563,11 @@ async def control_handler(event):
             f"- فوري: {stats['immediate']}\n"
             f"- مجدول: {stats['scheduled']}\n"
             f"- تحليل: {stats['analysis']}\n"
-            f"- موجز ساعة: {stats['hourly']}\n"  # ← جديد
+            f"- موجز ساعة: {stats['hourly']}\n"
+            f"- OpenAI: {stats['openai_usage']}\n"
+            f"- Gemini: {stats['gemini_usage']}\n"
             f"- تجميد: {stats['flood_waits']}"
         )
-    
     elif "قنوات" in text:
         await event.reply(
             f"📡 **القنوات الحالية**\n"
@@ -556,20 +579,16 @@ async def control_handler(event):
             f"- موجز هدف: `{HOURLY_TARGET_ID or 'غير مفعل'}`\n"
             f"- التحكم: `{CONTROL_CHANNEL_ID}`"
         )
-    
-    # === الصيانة ===
     elif "مسح المخزن" in text:
         count1 = len(translation_queue)
         count2 = len(hourly_queue)
         translation_queue.clear()
         hourly_queue.clear()
         await event.reply(f"🧹 تم مسح {count1 + count2} رسالة من المكدسين.")
-    
     elif "إعادة تعيين" in text:
         before = len(posted_texts)
         posted_texts.clear()
         await event.reply(f"♻️ تم مسح {before} سجل مؤقت.")
-    
     elif "وضع تجربة on" in text:
         dry_run_mode = True
         logging.info("🧪 تم تفعيل وضع التجربة.")
@@ -578,8 +597,6 @@ async def control_handler(event):
         dry_run_mode = False
         logging.info("🚀 تم إيقاف وضع التجربة.")
         await event.reply("🚀 تم إيقاف وضع التجربة (النشر الفعلي نشط).")
-    
-    # === عرض المساعدة الكاملة ===
     elif "مساعدة" in text:
         help_msg = (
             "🛠️ **أوامر التحكم الكاملة**\n"
@@ -607,8 +624,6 @@ async def control_handler(event):
             "💡 جميع الأوامر تعمل في قناة التحكم فقط."
         )
         await event.reply(help_msg)
-
-    # === المساعدة التلقائية ===
     else:
         quick_help = (
             "🔍 **أمر غير معروف**\n\n"
@@ -636,7 +651,6 @@ async def handle_source(event, emoji):
     text = message.message or ""
     cleaned = clean_text(text)
     
-    # ✅ 1. البيانات الاقتصادية
     if publish_economic and is_economic_data(cleaned):
         final_text = await format_final_text(cleaned, emoji)
         sent = await forward_or_send(message, final_text, "نشر فوري (اقتصادي)")
@@ -645,12 +659,10 @@ async def handle_source(event, emoji):
             last_immediate_post_time = datetime.now()
         return
     
-    # 🚫 بيانات اقتصادية لكن النشر الاقتصادي متوقف
     if not publish_economic and is_economic_data(cleaned):
         logging.info(f"🚫 تم تجاهل بيانات اقتصادية ID={message.id}")
         return
 
-    # ✅ 2. النشر الفوري العادي
     text_lower = cleaned.lower()
     if publish_immediate and any(keyword.lower() in text_lower for keyword in KEYWORDS_LIST):
         can_publish = await can_publish_immediate()
@@ -665,7 +677,6 @@ async def handle_source(event, emoji):
             logging.info(f"⏳ تأجيل (لا تحقق شروط الفوري) ID={message.id}")
         return
 
-    # ✅ 3. الباقي
     translation_queue.append((event, emoji, None, None))
     logging.info(f"📥 أُضيفت الرسالة ID={message.id} للمكدس")
 
@@ -721,41 +732,24 @@ async def generate_hourly_summary(manual=False):
         logging.info("📭 مكدس موجز الساعة فارغ — لن يتم النشر.")
         return
 
-    # جمع جميع الأخبار في نص واحد
     combined_text = "\n".join(hourly_queue)
-    hourly_queue.clear()  # تفريغ المكدس
+    hourly_queue.clear()
 
-    client_ai = openai_manager.get_client()
-    try:
-        response = client_ai.chat.completions.create(
-            model="gpt-5-nano",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "أنت محرر اقتصادي محترف في عام 2026. حيث ترمب هو رئيس اميركا"
-                        "لخص الأخبار التالية في موجز ساعة اقتصادي شامل بالعربية. "
-                        "ركز على التأثيرات الرئيسية، المؤشرات، وتصريحات المسؤولين. "
-                        "اجعله جذابًا ومختصرًا (لا يتجاوز 120 كلمة). "
-                        "ابدأ بعنوان جذاب مثل: '📊 موجز الساعة الاقتصادية'."
-                    )
-                },
-                {"role": "user", "content": combined_text}
-            ]
-            #temperature=0.6,
-        )
-        summary = response.choices[0].message.content.strip()
-    except Exception as e:
-        error_str = str(e)
-        logging.warning(f"⚠️ فشل في إنشاء موجز الساعة: {error_str[:100]}...")
-        if hasattr(client_ai, 'api_key'):
-            openai_manager.mark_failed(client_ai.api_key, error_str)
+    system_prompt = (
+        "أنت محرر اقتصادي محترف في عام 2026. حيث ترمب هو رئيس اميركا"
+        "لخص الأخبار التالية في موجز ساعة اقتصادي شامل بالعربية. "
+        "ركز على التأثيرات الرئيسية، المؤشرات، وتصريحات المسؤولين. "
+        "اجعله جذابًا ومختصرًا (لا يتجاوز 120 كلمة). "
+        "ابدأ بعنوان جذاب مثل: '📊 موجز الساعة الاقتصادية'."
+    )
+    
+    summary = await call_ai_with_fallback(system_prompt, combined_text)
+    if not summary:
         summary = f"📊 **موجز الساعة الاقتصادية**\n\nفشل في التوليد. الأصل:\n```{combined_text[:300]}...```"
 
     signature = HOURLY_SIGNATURE
     final_text = f"{summary}\n\n{signature}\n\n{CHANNEL_WATERMARK}"[:4000]
 
-    # إنشاء رسالة وهمية لاستخدامها في forward_or_send
     class FakeMessage:
         id = int(time.time())
     fake_msg = FakeMessage()
@@ -766,7 +760,6 @@ async def generate_hourly_summary(manual=False):
 
 # ---------------- جدولة موجز الساعة ----------------
 async def hourly_scheduler():
-    """ينشر موجز الساعة كل ساعة عند الدقيقة 00."""
     while True:
         now = datetime.now()
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
@@ -814,7 +807,6 @@ async def main():
     me = await client.get_me()
     logging.info(f"✅ تسجيل الدخول باسم: {me.first_name}")
     
-    # ✅ تهيئة جميع القنوات من .env (ثابتة)
     try:
         CONTROL_CHANNEL_ID = await resolve_channel(CONTROL_CHANNEL)
         SOURCE_CHANNEL_ID = await resolve_channel(SOURCE_CHANNEL)
@@ -834,31 +826,18 @@ async def main():
         logging.critical(f"❌ فشل تهيئة القنوات: {e}")
         return
     
-    # ✅ ربط ثابت بقناة التحكم (من .env فقط)
     client.add_event_handler(control_handler, events.NewMessage(chats=[CONTROL_CHANNEL_ID]))
-    
-    # ✅ ربط المصادر
     client.add_event_handler(lambda e: handle_source(e, EMOJI_IMMEDIATE), events.NewMessage(chats=[SOURCE_CHANNEL_ID]))
     client.add_event_handler(lambda e: handle_source(e, EMOJI_SCHEDULED), events.NewMessage(chats=[SOURCE_CHANNEL_2_ID]))
     
-    # ✅ ربط قناة التحليل
     if ANALYST_SOURCE_ID and ANALYST_TARGET_ID:
-        client.add_event_handler(
-            analyst_handler,
-            events.NewMessage(chats=[ANALYST_SOURCE_ID])
-        )
+        client.add_event_handler(analyst_handler, events.NewMessage(chats=[ANALYST_SOURCE_ID]))
     
-    # ✅ ربط مصدر موجز الساعة
     if HOURLY_SOURCE_ID:
         client.add_event_handler(handle_hourly_source, events.NewMessage(chats=[HOURLY_SOURCE_ID]))
 
     logging.info("🤖 EcoPulse Bot جاهز — في انتظار الأوامر في قناة التحكم.")
-    # تشغيل الجدولة والمراقبة بالتوازي
-    await asyncio.gather(
-        publisher(),
-        hourly_scheduler(),
-        client.run_until_disconnected()
-    )
+    await asyncio.gather(publisher(), hourly_scheduler(), client.run_until_disconnected())
 
 if __name__ == "__main__":
     try:
@@ -867,7 +846,3 @@ if __name__ == "__main__":
         logging.info("🛑 تم إيقاف البوت يدوياً.")
     except Exception as e:
         logging.critical(f"💥 خطأ فادح: {e}", exc_info=True)
-
-
-
-
