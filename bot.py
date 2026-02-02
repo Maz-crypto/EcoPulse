@@ -166,7 +166,7 @@ class AIManager:
         self.usage_stats["gemini"][key] += 1
         logging.debug(f"🔑 استخدام مفتاح Gemini: {key[:5]}... (الاستخدام: {self.usage_stats['gemini'][key]})")
         genai.configure(api_key=key)
-        return genai.GenerativeModel('gemini-pro')
+        return genai.GenerativeModel('gemini-3-flash-preview')  # ← مدعوم عالميًا
 
     def mark_openai_failed(self, key: str, error: str = ""):
         self.failed_openai[key] = time.time()
@@ -846,3 +846,4 @@ if __name__ == "__main__":
         logging.info("🛑 تم إيقاف البوت يدوياً.")
     except Exception as e:
         logging.critical(f"💥 خطأ فادح: {e}", exc_info=True)
+
