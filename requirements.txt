@@ -1,4 +1,5 @@
 telethon
 deep-translator
 python-dotenv
+google-generativeai
 openai
