@@ -8,6 +8,7 @@ EcoPulse Bot — النسخة النهائية المستقرة مع دعم مو
 ✅ نشر فوري مشروط (600 مشاهدة أو 8 دقائق)
 ✅ موجز ساعة اقتصادي تلقائي
 ✅ دعم OpenAI + Gemini (احتياطي تلقائي)
+✅ نظام حماية ضد انقطاع الاتصال (إعادة المحاولة التلقائية)
 """
 
 import asyncio
@@ -15,6 +16,7 @@ import os
 import logging
 import re
 import time
+import json
 from datetime import datetime, timedelta
 from collections import deque
 from collections import defaultdict
@@ -24,7 +26,7 @@ from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 from openai import OpenAI
-import google.generativeai as genai
+from google import genai
 
 # ---------------- تحميل الإعدادات ----------------
 load_dotenv()
@@ -53,9 +55,53 @@ HOURLY_SOURCE_ID = None
 HOURLY_TARGET_ID = None
 
 # ---------------- إعدادات النشر ----------------
-IMMEDIATE_MIN_VIEWS = 600
-IMMEDIATE_TIMEOUT = 8 * 60
-MIN_VIEWS_FOR_NEXT = int(os.getenv("MIN_VIEWS_FOR_NEXT", "800"))
+# يمكن تغيير هذه القيم مباشرة من قناة التحكم دون إعادة تشغيل البوت.
+IMMEDIATE_MIN_VIEWS = int(os.getenv("IMMEDIATE_MIN_VIEWS", "500"))
+IMMEDIATE_TIMEOUT = int(os.getenv("IMMEDIATE_TIMEOUT", str(8 * 60)))
+MIN_VIEWS_FOR_NEXT = int(os.getenv("MIN_VIEWS_FOR_NEXT", "500"))
+PUBLISHER_DELAY = int(os.getenv("PUBLISHER_DELAY", "10"))
+VIEW_CHECK_INTERVAL = int(os.getenv("VIEW_CHECK_INTERVAL", "60"))
+ANALYST_POST_INTERVAL = int(os.getenv("ANALYST_POST_INTERVAL", "900"))
+HOURLY_MAX_WORDS = int(os.getenv("HOURLY_MAX_WORDS", "120"))
+SETTINGS_FILE = os.getenv("SETTINGS_FILE", "ecopulse_runtime_settings.json")
+
+def load_runtime_settings():
+    """تحميل إعدادات التحكم المحفوظة إن وجدت."""
+    global IMMEDIATE_MIN_VIEWS, IMMEDIATE_TIMEOUT, MIN_VIEWS_FOR_NEXT
+    global PUBLISHER_DELAY, VIEW_CHECK_INTERVAL, ANALYST_POST_INTERVAL, HOURLY_MAX_WORDS
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for name in (
+                "IMMEDIATE_MIN_VIEWS", "IMMEDIATE_TIMEOUT", "MIN_VIEWS_FOR_NEXT",
+                "PUBLISHER_DELAY", "VIEW_CHECK_INTERVAL", "ANALYST_POST_INTERVAL",
+                "HOURLY_MAX_WORDS"
+            ):
+                if name in data:
+                    globals()[name] = int(data[name])
+            logging.info("✅ تم تحميل إعدادات التحكم المحفوظة.")
+    except Exception as e:
+        logging.warning(f"⚠️ تعذر تحميل إعدادات التحكم: {e}")
+
+def save_runtime_settings():
+    """حفظ إعدادات التحكم الحالية لتبقى بعد إعادة التشغيل."""
+    data = {
+        "IMMEDIATE_MIN_VIEWS": IMMEDIATE_MIN_VIEWS,
+        "IMMEDIATE_TIMEOUT": IMMEDIATE_TIMEOUT,
+        "MIN_VIEWS_FOR_NEXT": MIN_VIEWS_FOR_NEXT,
+        "PUBLISHER_DELAY": PUBLISHER_DELAY,
+        "VIEW_CHECK_INTERVAL": VIEW_CHECK_INTERVAL,
+        "ANALYST_POST_INTERVAL": ANALYST_POST_INTERVAL,
+        "HOURLY_MAX_WORDS": HOURLY_MAX_WORDS,
+    }
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        logging.error(f"❌ تعذر حفظ إعدادات التحكم: {e}")
+        return False
 
 # ---------------- مفاتيح الذكاء الاصطناعي ----------------
 OPENAI_KEYS = os.getenv("OPENAI_API_KEYS", "").split(",")
@@ -70,7 +116,7 @@ if not OPENAI_KEYS and not GEMINI_KEYS:
     raise ValueError("❌ لا توجد مفاتيح OpenAI أو Gemini صالحة في ملف .env")
 
 # ---------------- إعدادات عامة ----------------
-KEYWORDS_LIST = ["JUST IN", "MACRO", "$MACRO", "marco", "FEDERAL", "POWELL", "powell", "TRUMP", "FED'S", "FED", "🔴"]
+KEYWORDS_LIST = ["JUST IN", "MACRO", "$MACRO", "marco", "FEDERAL", "warsh", "WARSH", "TRUMP", "FED'S", "FED", "🔴"]
 EMOJI_IMMEDIATE = "🚨"
 EMOJI_SCHEDULED = "📝"
 EMOJI_ALERT = "⚠️🚨"
@@ -79,7 +125,16 @@ CHANNEL_WATERMARK = " "
 HOURLY_SIGNATURE = os.getenv("HOURLY_SIGNATURE", "— موجز الساعة")
 
 # ---------------- التهيئة ----------------
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+# تم إضافة إعدادات التايم أوت لاصطياد الانقطاع سريعاً بدلاً من التجمد
+client = TelegramClient(
+    StringSession(SESSION_STRING), 
+    API_ID, 
+    API_HASH,
+    connection_retries=3,
+    timeout=15,
+    auto_reconnect=True
+)
+
 translation_queue = deque()
 hourly_queue = deque()
 posted_texts = set()
@@ -103,6 +158,7 @@ stats = {
     "posts": 0,
     "economic": 0,
     "immediate": 0,
+    
     "scheduled": 0,
     "analysis": 0,
     "hourly": 0,
@@ -116,6 +172,11 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(), logging.FileHandler("bot_activity.log", "a", encoding="utf-8")]
 )
+
+# كتم رسائل إعادة الاتصال الداخلية لمكتبة Telethon لمنع الامتلاء في اللوج
+logging.getLogger('telethon').setLevel(logging.CRITICAL)
+
+load_runtime_settings()
 
 # ---------------- إدارة مفاتيح الذكاء الاصطناعي ----------------
 class AIManager:
@@ -158,15 +219,21 @@ class AIManager:
 
     def get_gemini_client(self):
         usable_keys = self._get_usable_keys("gemini")
+
         if not usable_keys:
             logging.warning("⚠️ جميع مفاتيح Gemini معطّلة")
             return None
+
         key = usable_keys[self.gemini_index % len(usable_keys)]
         self.gemini_index += 1
         self.usage_stats["gemini"][key] += 1
-        logging.debug(f"🔑 استخدام مفتاح Gemini: {key[:5]}... (الاستخدام: {self.usage_stats['gemini'][key]})")
-        genai.configure(api_key=key)
-        return genai.GenerativeModel('gemini-3-flash-preview')  # ← مدعوم عالميًا
+
+        logging.debug(
+            f"🔑 استخدام مفتاح Gemini: {key[:5]}... "
+            f"(الاستخدام: {self.usage_stats['gemini'][key]})"
+        )
+
+        return genai.Client(api_key=key)
 
     def mark_openai_failed(self, key: str, error: str = ""):
         self.failed_openai[key] = time.time()
@@ -275,6 +342,7 @@ async def can_publish_immediate() -> bool:
     if last_immediate_post_id is None:
         return True
     
+    views = 0
     try:
         post = await client.get_messages(TARGET_CHANNEL_ID, ids=last_immediate_post_id)
         views = post.views or 0
@@ -327,34 +395,61 @@ async def call_openai(prompt: str, user_content: str, max_retries=3):
     return None
 
 async def call_gemini(prompt: str, user_content: str, max_retries=3):
-    """استدعاء Gemini باستخدام gemini-pro"""
+    """استدعاء Gemini باستخدام google-genai SDK"""
+
     for attempt in range(max_retries):
-        model = ai_manager.get_gemini_client()
-        if not model:
+        client_gemini = ai_manager.get_gemini_client()
+
+        if not client_gemini:
             return None
-            
+
         try:
-            full_prompt = f"{prompt}\n\nالمحتوى: {user_content}"
-            response = await model.generate_content_async(full_prompt)
+            full_prompt = f"{prompt}\n\nالمحتوى:\n{user_content}"
+
+            response = await client_gemini.aio.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=full_prompt
+            )
+
             stats["gemini_usage"] += 1
-            return response.text.strip()
+
+            if response.text:
+                return response.text.strip()
+
+            logging.warning("⚠️ Gemini أعاد استجابة فارغة")
+
         except Exception as e:
             error_str = str(e)
-            logging.warning(f"❌ فشل Gemini (محاولة {attempt + 1}): {error_str[:100]}...")
+
+            logging.warning(
+                f"❌ فشل Gemini (محاولة {attempt + 1}): "
+                f"{error_str[:200]}"
+            )
+
             if ai_manager.gemini_keys:
-                current_key = ai_manager.gemini_keys[(ai_manager.gemini_index - 1) % len(ai_manager.gemini_keys)]
-                ai_manager.mark_gemini_failed(current_key, error_str)
+                current_key = ai_manager.gemini_keys[
+                    (ai_manager.gemini_index - 1)
+                    % len(ai_manager.gemini_keys)
+                ]
+
+                ai_manager.mark_gemini_failed(
+                    current_key,
+                    error_str
+                )
+
             if attempt < max_retries - 1:
                 await asyncio.sleep(2)
+
     return None
 
 async def call_ai_with_fallback(prompt: str, user_content: str) -> str:
-    """استدعاء OpenAI أولاً، ثم Gemini كخيار احتياطي"""
+    
+    logging.info("Call Gemini ")
     result = await call_openai(prompt, user_content)
     if result is not None:
         return result
         
-    logging.info("🔄 التبديل إلى Gemini بسبب فشل OpenAI")
+    """استدعاء Gemini أولاً، ثم OpenAI كخيار احتياطي"""
     result = await call_gemini(prompt, user_content)
     if result is not None:
         return result
@@ -368,8 +463,8 @@ async def analyze_and_translate(text: str, target_lang: str, max_retries: int = 
         return {"impact": "⚪ تأثير محايد", "translation": ""}
 
     system_prompt = (
-        "أنت محلل اقتصادي ومترجم محترف في عام 2026 حيث ترامب هو رئيس امريكا. "
-        "حلّل الخبر، ثم أعد صياغته بالعربية بأسلوب اقتصادي مختصر. "
+        "أنت محلل اقتصادي ومتداول ومترجم محترف في عام 2026 حيث ترامب هو رئيس امريكا. "
+        "حلّل الخبر، ثم أعد صياغته بالعربية بأسلوب اقتصادي مختصر مع اضافة اموجن مناسب. "
         "أولاً، قدم تقييمًا للتأثير من كلمتين إلى أربع. "
         "ثم ضع ### ثم أعد الصياغة بالعربية."
     )
@@ -415,7 +510,7 @@ async def format_final_text(text: str, emoji: str, signature: str = None, attent
         return final_text[:4000]
 
     elif "MACRO" in text.upper():
-        system_prompt = "أنت محلل اقتصادي حيث ترامب هو الرئيس الحالي لامريكا. قم بتحليل الخبر بالعربية ≤ 10 كلمات."
+        system_prompt = "أنت محلل اقتصادي بعقلية متداول حيث ترامب هو الرئيس الحالي لامريكا. قم بتحليل الخبر بالعربية ≤ 10 كلمات."
         translation = await call_ai_with_fallback(system_prompt, text)
         if not translation:
             fallback = f"💡 **تحليل اقتصادي**\n\n```{clean_text(text)[:150]}...```\n\n{signature}"
@@ -461,183 +556,446 @@ async def forward_or_send(message, caption: str, task_name="", target_channel=No
     except Exception:
         logging.exception("Error while sending message")
 
-# ---------------- معالجة التحكم (مرتبطة بقناة التحكم الثابتة) ----------------
+# ---------------- أدوات إعدادات التحكم ----------------
+def format_duration(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} ساعة"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} دقيقة"
+    return f"{seconds} ثانية"
+
+def settings_status() -> str:
+    return (
+        "⚙️ **إعدادات التحكم الحالية | Runtime Settings**\n\n"
+        f"⚡ حد المشاهدات للفوري: `{IMMEDIATE_MIN_VIEWS}`\n"
+        f"⏱️ مهلة الفوري: `{format_duration(IMMEDIATE_TIMEOUT)}`\n"
+        f"📈 حد مشاهدات المنشور التالي: `{MIN_VIEWS_FOR_NEXT}`\n"
+        f"⏳ الفاصل بين المنشورات: `{PUBLISHER_DELAY}` ثانية\n"
+        f"🔄 فحص المشاهدات كل: `{VIEW_CHECK_INTERVAL}` ثانية\n"
+        f"🧠 فاصل التحليل: `{format_duration(ANALYST_POST_INTERVAL)}`\n"
+        f"⏰ حد كلمات موجز الساعة: `{HOURLY_MAX_WORDS}`\n"
+        f"💾 الحفظ التلقائي: `{SETTINGS_FILE}`"
+    )
+
+def parse_duration(value: str):
+    """يدعم: 30s / 5m / 2h أو رقمًا بالثواني."""
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*", value.lower())
+    if not m:
+        return None
+    n = float(m.group(1))
+    unit = m.group(2)
+    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600}[unit]
+    result = int(n * multiplier)
+    return result if result > 0 else None
+
+def setting_command(text: str):
+    """يعيد (اسم الإعداد، القيمة) أو None."""
+    m = re.match(r"^(?:إعداد|اعداد|set)\s+(.+?)\s+(.+)$", text, re.IGNORECASE)
+    if not m:
+        return None
+    key = m.group(1).strip().lower()
+    value = m.group(2).strip()
+    aliases = {
+        "الفوري": "immediate_views",
+        "مشاهدات الفوري": "immediate_views",
+        "حد الفوري": "immediate_views",
+        "immediate views": "immediate_views",
+        "immediate_views": "immediate_views",
+        "مهلة الفوري": "immediate_timeout",
+        "مدة الفوري": "immediate_timeout",
+        "immediate timeout": "immediate_timeout",
+        "immediate_timeout": "immediate_timeout",
+        "مشاهدات التالي": "next_views",
+        "حد التالي": "next_views",
+        "حد المجدول": "next_views",
+        "next views": "next_views",
+        "next_views": "next_views",
+        "فاصل النشر": "publish_delay",
+        "تأخير النشر": "publish_delay",
+        "publish delay": "publish_delay",
+        "publish_delay": "publish_delay",
+        "فحص المشاهدات": "view_check",
+        "view check": "view_check",
+        "view_check": "view_check",
+        "فاصل التحليل": "analyst_interval",
+        "التحليل": "analyst_interval",
+        "analyst interval": "analyst_interval",
+        "analyst_interval": "analyst_interval",
+        "كلمات الموجز": "hourly_words",
+        "حد الموجز": "hourly_words",
+        "hourly words": "hourly_words",
+        "hourly_words": "hourly_words",
+    }
+    return aliases.get(key), value
+
+# ---------------- معالجة التحكم بالعربية والإنجليزية ----------------
 @client.on(events.NewMessage(chats=[]))
 async def control_handler(event):
-    global bot_active, publish_immediate, publish_economic, publish_analysis, publish_scheduled, publish_hourly, dry_run_mode
-    
-    raw_text = event.raw_text.strip()
-    if not raw_text:
-        raw_text = "مساعدة"
-    
-    text = raw_text
-    
-    if "تفعيل" in text:
+    global bot_active, publish_immediate, publish_economic
+    global publish_analysis, publish_scheduled, publish_hourly, dry_run_mode
+    global IMMEDIATE_MIN_VIEWS, IMMEDIATE_TIMEOUT, MIN_VIEWS_FOR_NEXT
+    global PUBLISHER_DELAY, VIEW_CHECK_INTERVAL, ANALYST_POST_INTERVAL, HOURLY_MAX_WORDS
+
+    raw_text = (event.raw_text or "").strip()
+    text = raw_text.lower().strip() if raw_text else "مساعدة"
+
+    # مجموعات أوامر ثنائية اللغة
+    commands = {
+        "start": {"تفعيل", "تشغيل", "ابدأ", "start", "enable", "activate", "/start"},
+        "stop": {"ايقاف", "إيقاف", "تعطيل", "توقف", "stop", "disable", "deactivate", "/stop"},
+        "immediate_on": {"نشر فوري on", "نشر فوري تشغيل", "فوري on", "فوري تشغيل", "immediate on", "immediate enable", "immediate start", "instant on", "instant enable"},
+        "immediate_off": {"نشر فوري off", "نشر فوري إيقاف", "نشر فوري تعطيل", "فوري off", "فوري إيقاف", "immediate off", "immediate disable", "instant off", "instant disable"},
+        "economic_on": {"اقتصادي on", "اقتصادي تشغيل", "اقتصاد on", "economic on", "economic enable", "economic start", "economy on", "macro on"},
+        "economic_off": {"اقتصادي off", "اقتصادي إيقاف", "اقتصادي تعطيل", "اقتصاد off", "economic off", "economic disable", "economy off", "macro off"},
+        "analysis_on": {"تحليل on", "تحليل تشغيل", "تحليل تفعيل", "analysis on", "analysis enable", "analysis start", "analyst on"},
+        "analysis_off": {"تحليل off", "تحليل إيقاف", "تحليل تعطيل", "analysis off", "analysis disable", "analyst off"},
+        "scheduled_on": {"مجدول on", "مجدول تشغيل", "مجدول تفعيل", "scheduled on", "scheduled enable", "scheduled start", "scheduler on"},
+        "scheduled_off": {"مجدول off", "مجدول إيقاف", "مجدول تعطيل", "scheduled off", "scheduled disable", "scheduler off"},
+        "hourly_on": {"موجز on", "موجز تشغيل", "موجز تفعيل", "hourly on", "hourly enable", "hourly start", "summary on"},
+        "hourly_off": {"موجز off", "موجز إيقاف", "موجز تعطيل", "hourly off", "hourly disable", "summary off"},
+        "hourly_now": {"موجز الآن", "موجز الان", "أنشئ موجز", "انشئ موجز", "hourly now", "summary now", "generate summary", "generate hourly", "generate hourly summary"},
+        "status": {"حالة", "الحالة", "status", "state", "/status"},
+        "keys": {"مفاتيح", "مفاتيح ai", "مفاتيح الذكاء", "keys", "ai keys", "api keys", "key status"},
+        "queue": {"مكدس", "المكدس", "queue", "queues", "queue status"},
+        "stats": {"إحصاء", "احصاء", "إحصائيات", "احصائيات", "stats", "statistics", "stat"},
+        "channels": {"قنوات", "القنوات", "channels", "channel status", "channel"},
+        "settings": {"إعدادات", "اعدادات", "settings", "config", "configuration"},
+        "save_settings": {"حفظ الإعدادات", "حفظ الاعدادات", "save settings", "save config"},
+        "publish_next": {"نشر التالي", "نشر الآن من المكدس", "publish next", "publish queued"},
+        "clear_queue": {"مسح المخزن", "مسح المكدس", "مسح الطابور", "clear queue", "queue clear", "clear queues", "clear storage"},
+        "reset": {"إعادة تعيين", "اعادة تعيين", "مسح التكرار", "reset", "reset history", "clear history"},
+        "dry_on": {"وضع تجربة on", "تجربة on", "dry run on", "dryrun on", "test mode on", "test on"},
+        "dry_off": {"وضع تجربة off", "تجربة off", "dry run off", "dryrun off", "test mode off", "test off"},
+        "help": {"مساعدة", "ساعدني", "الأوامر", "الاوامر", "help", "commands", "/help", "/commands"},
+    }
+
+    # أوامر الإعدادات المرنة: إعداد <اسم> <قيمة>
+    parsed_setting = setting_command(raw_text)
+    if parsed_setting:
+        setting_name, raw_value = parsed_setting
+        await event.reply( setting_name )
+        if setting_name is None:
+            await event.reply(
+                "❌ **إعداد غير معروف**\n\n"
+                "استخدم `إعدادات` لرؤية الخيارات، أو مثال:\n"
+                "`إعداد مشاهدات الفوري 50`\n"
+                "`إعداد مهلة الفوري 10m`"
+            )
+            return
+
+        duration_fields = {"immediate_timeout", "publish_delay", "view_check", "analyst_interval"}
+        try:
+            if setting_name in duration_fields:
+                value = parse_duration(raw_value)
+                if value is None:
+                    raise ValueError("صيغة مدة غير صحيحة")
+            else:
+                value = int(raw_value)
+                if value <= 0:
+                    raise ValueError("يجب أن تكون القيمة أكبر من صفر")
+
+            if setting_name == "immediate_views":
+                IMMEDIATE_MIN_VIEWS = value
+                label = "حد مشاهدات النشر الفوري"
+            elif setting_name == "immediate_timeout":
+                IMMEDIATE_TIMEOUT = value
+                label = "مهلة النشر الفوري"
+            elif setting_name == "next_views":
+                MIN_VIEWS_FOR_NEXT = value
+                label = "حد مشاهدات المنشور التالي"
+            elif setting_name == "publish_delay":
+                PUBLISHER_DELAY = value
+                label = "الفاصل بين المنشورات"
+            elif setting_name == "view_check":
+                VIEW_CHECK_INTERVAL = value
+                label = "فاصل فحص المشاهدات"
+            elif setting_name == "analyst_interval":
+                ANALYST_POST_INTERVAL = value
+                label = "فاصل التحليل"
+            else:
+                HOURLY_MAX_WORDS = value
+                label = "حد كلمات موجز الساعة"
+
+            save_runtime_settings()
+            await event.reply(
+                f"✅ **تم تحديث الإعداد**\n\n"
+                f"⚙️ {label}: `{format_duration(value) if setting_name in duration_fields else value}`\n\n"
+                "💾 تم حفظه وسيبقى بعد إعادة التشغيل."
+            )
+        except ValueError:
+            await event.reply(
+                "❌ **قيمة غير صالحة.**\n\n"
+                "للأرقام: `50`\n"
+                "للمدد: `30s` أو `5m` أو `2h`."
+            )
+        return
+
+    # تحديد الأمر بالضبط لتجنب تداخل كلمات مثل "on" داخل أمر آخر
+    action = next((name for name, variants in commands.items() if text in variants), None)
+
+    if action == "start":
         bot_active = True
-        logging.info("✅ تم تفعيل البوت كاملاً.")
-        await event.reply("✅ تم تفعيل البوت كاملاً.")
-    elif "ايقاف" in text:
+        logging.info("✅ تم تفعيل البوت بالكامل.")
+        await event.reply("✅ **تم تفعيل البوت بالكامل**\n\n🤖 Bot is now fully active.")
+        return
+
+    if action == "stop":
         bot_active = False
-        logging.info("⛔ تم إيقاف البوت كاملاً.")
-        await event.reply("⛔ تم إيقاف البوت كاملاً.")
-    elif "نشر فوري on" in text:
+        logging.info("⛔ تم إيقاف البوت بالكامل.")
+        await event.reply("⛔ **تم إيقاف البوت بالكامل**\n\n🤖 Bot has been completely stopped.")
+        return
+
+    if action == "immediate_on":
         publish_immediate = True
-        logging.info("✅ تم تفعيل النشر الفوري (غير الاقتصادي).")
-        await event.reply("✅ تم تفعيل النشر الفوري (غير الاقتصادي).")
-    elif "نشر فوري off" in text:
+        await event.reply("✅ **تم تفعيل النشر الفوري**\n\n⚡ Immediate publishing: ON")
+        return
+
+    if action == "immediate_off":
         publish_immediate = False
-        logging.info("⛔ تم إيقاف النشر الفوري (غير الاقتصادي).")
-        await event.reply("⛔ تم إيقاف النشر الفوري (غير الاقتصادي).")
-    elif "اقتصادي on" in text:
+        await event.reply("⛔ **تم إيقاف النشر الفوري**\n\n⚡ Immediate publishing: OFF")
+        return
+
+    if action == "economic_on":
         publish_economic = True
-        logging.info("✅ تم تفعيل معالجة البيانات الاقتصادية.")
-        await event.reply("✅ تم تفعيل معالجة البيانات الاقتصادية.")
-    elif "اقتصادي off" in text:
+        await event.reply("✅ **تم تفعيل البيانات الاقتصادية**\n\n📊 Economic data: ON")
+        return
+
+    if action == "economic_off":
         publish_economic = False
-        logging.info("⛔ تم إيقاف معالجة البيانات الاقتصادية.")
-        await event.reply("⛔ تم إيقاف معالجة البيانات الاقتصادية.")
-    elif "تحليل on" in text:
+        await event.reply("⛔ **تم إيقاف البيانات الاقتصادية**\n\n📊 Economic data: OFF")
+        return
+
+    if action == "analysis_on":
         publish_analysis = True
-        logging.info("✅ تم تفعيل قناة التحليل.")
-        await event.reply("✅ تم تفعيل قناة التحليل.")
-    elif "تحليل off" in text:
+        await event.reply("✅ **تم تفعيل قناة التحليل**\n\n🧠 Analysis: ON")
+        return
+
+    if action == "analysis_off":
         publish_analysis = False
-        logging.info("⛔ تم إيقاف قناة التحليل.")
-        await event.reply("⛔ تم إيقاف قناة التحليل.")
-    elif "مجدول on" in text:
+        await event.reply("⛔ **تم إيقاف قناة التحليل**\n\n🧠 Analysis: OFF")
+        return
+
+    if action == "scheduled_on":
         publish_scheduled = True
-        logging.info("✅ تم تفعيل الناشر المجدول.")
-        await event.reply("✅ تم تفعيل الناشر المجدول.")
-    elif "مجدول off" in text:
+        await event.reply("✅ **تم تفعيل النشر المجدول**\n\n📝 Scheduled publishing: ON")
+        return
+
+    if action == "scheduled_off":
         publish_scheduled = False
-        logging.info("⛔ تم إيقاف الناشر المجدول.")
-        await event.reply("⛔ تم إيقاف الناشر المجدول.")
-    elif "موجز on" in text:
+        await event.reply("⛔ **تم إيقاف النشر المجدول**\n\n📝 Scheduled publishing: OFF")
+        return
+
+    if action == "hourly_on":
         publish_hourly = True
-        logging.info("✅ تم تفعيل موجز الساعة.")
-        await event.reply("✅ تم تفعيل موجز الساعة.")
-    elif "موجز off" in text:
+        await event.reply("✅ **تم تفعيل موجز الساعة**\n\n⏰ Hourly summary: ON")
+        return
+
+    if action == "hourly_off":
         publish_hourly = False
-        logging.info("⛔ تم إيقاف موجز الساعة.")
-        await event.reply("⛔ تم إيقاف موجز الساعة.")
-    elif "موجز الآن" in text:
+        await event.reply("⛔ **تم إيقاف موجز الساعة**\n\n⏰ Hourly summary: OFF")
+        return
+
+    if action == "hourly_now":
         if not publish_hourly:
-            await event.reply("⚠️ موجز الساعة معطّل حاليًا. أرسل `موجز on` أولًا.")
+            await event.reply("⚠️ **موجز الساعة معطّل حاليًا.**\n\nأرسل `موجز on` أو `hourly on` أولًا.")
         else:
             await generate_hourly_summary(manual=True)
-            await event.reply("✅ تم طلب إنشاء موجز الساعة يدويًا.")
-    elif "حالة" in text:
+            await event.reply("✅ **تم طلب إنشاء موجز الساعة يدويًا.**\n\n⏰ Hourly summary generation requested.")
+        return
+
+    if action == "status":
         status = (
-            f"📊 **حالة البوت**\n"
-            f"- نشط: {'✅' if bot_active else '⛔'}\n"
-            f"- نشر فوري: {'✅' if publish_immediate else '⛔'}\n"
-            f"- اقتصادي: {'✅' if publish_economic else '⛔'}\n"
-            f"- تحليل: {'✅' if publish_analysis else '⛔'}\n"
-            f"- مجدول: {'✅' if publish_scheduled else '⛔'}\n"
-            f"- موجز ساعة: {'✅' if publish_hourly else '⛔'}\n"
-            f"- مكدس عادي: {len(translation_queue)}\n"
-            f"- مكدس ساعة: {len(hourly_queue)}\n"
-            f"- وضع تجربة: {'🧪' if dry_run_mode else '🚀'}"
+            "📊 **حالة البوت | Bot Status**\n\n"
+            f"🤖 البوت | Bot: {'✅ نشط | ACTIVE' if bot_active else '⛔ متوقف | STOPPED'}\n"
+            f"⚡ النشر الفوري | Immediate: {'✅ ON' if publish_immediate else '⛔ OFF'}\n"
+            f"📊 الاقتصادي | Economic: {'✅ ON' if publish_economic else '⛔ OFF'}\n"
+            f"🧠 التحليل | Analysis: {'✅ ON' if publish_analysis else '⛔ OFF'}\n"
+            f"📝 المجدول | Scheduled: {'✅ ON' if publish_scheduled else '⛔ OFF'}\n"
+            f"⏰ موجز الساعة | Hourly: {'✅ ON' if publish_hourly else '⛔ OFF'}\n"
+            f"📥 المكدس العادي | Normal Queue: {len(translation_queue)}\n"
+            f"🕗 مكدس الساعة | Hourly Queue: {len(hourly_queue)}\n"
+            f"🧪 وضع التجربة | Dry Run: {'✅ ON' if dry_run_mode else '🚀 OFF'}"
         )
         await event.reply(status)
-    elif "مفاتيح" in text:
+        return
+
+    if action == "keys":
         status = ai_manager.get_status()
-        await event.reply(f"🔧 **حالة مفاتيح الذكاء الاصطناعي**\n\n{status}")
-    elif "مكدس" in text:
+        await event.reply(f"🔧 **حالة مفاتيح الذكاء الاصطناعي | AI Keys**\n\n{status}")
+        return
+
+    if action == "queue":
         count1 = len(translation_queue)
         count2 = len(hourly_queue)
-        msg = f"📥 **المكدس العادي**: {count1} رسالة\n"
-        msg += f"🕗 **مكدس موجز الساعة**: {count2} رسالة\n\n"
+        msg = f"📥 **المكدسات | Queues**\n\n📨 العادي | Normal: {count1}\n⏰ الساعة | Hourly: {count2}\n"
+
         if count1 > 0:
-            preview1 = "\n".join([f"{i+1}. {item[0].message.message[:30]}..." for i, item in enumerate(list(translation_queue)[:3])])
-            msg += f"**العادي**:\n{preview1}\n\n"
+            preview1 = "\n".join(
+                f"{i + 1}. {(item[0].message.message or '')[:50]}..."
+                for i, item in enumerate(list(translation_queue)[:5])
+            )
+            msg += f"\n**العادي | Normal:**\n{preview1}\n"
+
         if count2 > 0:
-            preview2 = "\n".join([f"{i+1}. {msg[:30]}..." for i, msg in enumerate(list(hourly_queue)[-3:])])
-            msg += f"**موجز الساعة**:\n{preview2}"
+            preview2 = "\n".join(
+                f"{i + 1}. {item[:50]}..."
+                for i, item in enumerate(list(hourly_queue)[-5:])
+            )
+            msg += f"\n**الساعة | Hourly:**\n{preview2}"
+
         await event.reply(msg)
-    elif "إحصاء" in text:
+        return
+
+    if action == "stats":
         await event.reply(
-            f"📈 **إحصاءات النشر**\n"
-            f"- المجموع: {stats['posts']}\n"
-            f"- اقتصادي: {stats['economic']}\n"
-            f"- فوري: {stats['immediate']}\n"
-            f"- مجدول: {stats['scheduled']}\n"
-            f"- تحليل: {stats['analysis']}\n"
-            f"- موجز ساعة: {stats['hourly']}\n"
-            f"- OpenAI: {stats['openai_usage']}\n"
-            f"- Gemini: {stats['gemini_usage']}\n"
-            f"- تجميد: {stats['flood_waits']}"
+            "📈 **إحصاءات النشر | Publishing Statistics**\n\n"
+            f"📊 المجموع | Total: {stats['posts']}\n"
+            f"📊 اقتصادي | Economic: {stats['economic']}\n"
+            f"⚡ فوري | Immediate: {stats['immediate']}\n"
+            f"📝 مجدول | Scheduled: {stats['scheduled']}\n"
+            f"🧠 تحليل | Analysis: {stats['analysis']}\n"
+            f"⏰ موجز | Hourly: {stats['hourly']}\n"
+            f"🤖 OpenAI: {stats['openai_usage']}\n"
+            f"✨ Gemini: {stats['gemini_usage']}\n"
+            f"⏳ FloodWait: {stats['flood_waits']}"
         )
-    elif "قنوات" in text:
+        return
+
+    if action == "channels":
         await event.reply(
-            f"📡 **القنوات الحالية**\n"
-            f"- المصدر 1: `{SOURCE_CHANNEL_ID}`\n"
-            f"- المصدر 2: `{SOURCE_CHANNEL_2_ID}`\n"
-            f"- الهدف: `{TARGET_CHANNEL_ID}`\n"
-            f"- تحليل: `{ANALYST_TARGET_ID or 'غير مفعل'}`\n"
-            f"- موجز مصدر: `{HOURLY_SOURCE_ID or 'غير مفعل'}`\n"
-            f"- موجز هدف: `{HOURLY_TARGET_ID or 'غير مفعل'}`\n"
-            f"- التحكم: `{CONTROL_CHANNEL_ID}`"
+            "📡 **القنوات | Channels**\n\n"
+            f"📥 المصدر 1 | Source 1: `{SOURCE_CHANNEL_ID}`\n"
+            f"📥 المصدر 2 | Source 2: `{SOURCE_CHANNEL_2_ID}`\n"
+            f"📤 الهدف | Target: `{TARGET_CHANNEL_ID}`\n"
+            f"🧠 التحليل | Analysis: `{ANALYST_TARGET_ID or 'غير مفعل | OFF'}`\n"
+            f"⏰ موجز المصدر | Hourly Source: `{HOURLY_SOURCE_ID or 'غير مفعل | OFF'}`\n"
+            f"⏰ موجز الهدف | Hourly Target: `{HOURLY_TARGET_ID or 'غير مفعل | OFF'}`\n"
+            f"🎛️ التحكم | Control: `{CONTROL_CHANNEL_ID}`"
         )
-    elif "مسح المخزن" in text:
+        return
+
+    if action == "settings":
+        await event.reply(settings_status())
+        return
+
+    if action == "save_settings":
+        ok = save_runtime_settings()
+        await event.reply(
+            "💾 **تم حفظ إعدادات التحكم.**" if ok
+            else "❌ **فشل حفظ إعدادات التحكم.**"
+        )
+        return
+
+    if action == "publish_next":
+        if not bot_active:
+            await event.reply("⚠️ البوت متوقف. أرسل `تفعيل` أولًا.")
+            return
+        if not translation_queue:
+            await event.reply("📭 **المكدس العادي فارغ.**")
+            return
+        try:
+            event_item, emoji, _, _ = translation_queue.popleft()
+            cleaned = clean_text(event_item.message.message or "")
+            final_text = await format_final_text(cleaned, emoji)
+            sent = await forward_or_send(event_item.message, final_text, "نشر يدوي من المكدس")
+            if sent:
+                await event.reply("✅ **تم نشر العنصر التالي يدويًا من المكدس.**")
+            else:
+                await event.reply("⚠️ **تعذر نشر العنصر التالي.**")
+        except Exception as e:
+            logging.exception("Manual queued publish failed")
+            await event.reply(f"❌ **فشل النشر اليدوي:** `{str(e)[:150]}`")
+        return
+
+    if action == "clear_queue":
         count1 = len(translation_queue)
         count2 = len(hourly_queue)
         translation_queue.clear()
         hourly_queue.clear()
-        await event.reply(f"🧹 تم مسح {count1 + count2} رسالة من المكدسين.")
-    elif "إعادة تعيين" in text:
+        await event.reply(
+            f"🧹 **تم مسح المكدسات | Queues Cleared**\n\n"
+            f"📨 Normal: {count1}\n⏰ Hourly: {count2}\n📊 Total: {count1 + count2}"
+        )
+        return
+
+    if action == "reset":
         before = len(posted_texts)
         posted_texts.clear()
-        await event.reply(f"♻️ تم مسح {before} سجل مؤقت.")
-    elif "وضع تجربة on" in text:
+        await event.reply(f"♻️ **تمت إعادة التعيين | Reset Complete**\n\n🗑️ Cleared {before} temporary records.")
+        return
+
+    if action == "dry_on":
         dry_run_mode = True
         logging.info("🧪 تم تفعيل وضع التجربة.")
-        await event.reply("🧪 تم تفعيل وضع التجربة (لن يُنشر فعليًا).")
-    elif "وضع تجربة off" in text:
+        await event.reply("🧪 **تم تفعيل وضع التجربة**\n\nNo messages will be actually published.")
+        return
+
+    if action == "dry_off":
         dry_run_mode = False
         logging.info("🚀 تم إيقاف وضع التجربة.")
-        await event.reply("🚀 تم إيقاف وضع التجربة (النشر الفعلي نشط).")
-    elif "مساعدة" in text:
+        await event.reply("🚀 **تم إيقاف وضع التجربة**\n\nReal publishing is now active.")
+        return
+
+    if action == "help":
         help_msg = (
-            "🛠️ **أوامر التحكم الكاملة**\n"
-            "```\n"
-            "# التحكم العام\n"
-            "تفعيل / ايقاف\n\n"
-            "# التحكم الجزئي\n"
-            "اقتصادي on/off\n"
-            "نشر فوري on/off\n"
-            "تحليل on/off\n"
-            "مجدول on/off\n"
-            "موجز on/off\n"
-            "موجز الآن\n\n"
-            "# المراقبة\n"
-            "حالة\n"
-            "مفاتيح\n"
-            "مكدس\n"
-            "إحصاء\n"
-            "قنوات\n\n"
-            "# الصيانة\n"
-            "مسح المخزن\n"
-            "إعادة تعيين\n"
-            "وضع تجربة on/off\n"
-            "```\n"
-            "💡 جميع الأوامر تعمل في قناة التحكم فقط."
+            "🛠️ **دليل التحكم المتقدم | Advanced Control**\n\n"
+            "🤖 **التشغيل العام**\n"
+            "`تفعيل` / `start` — تشغيل جميع المعالجات\n"
+            "`ايقاف` / `stop` — إيقاف المعالجة والنشر\n\n"
+
+            "⚡ **أنماط النشر**\n"
+            "`نشر فوري on/off` — تشغيل/إيقاف الأخبار الفورية\n"
+            "`اقتصادي on/off` — تشغيل/إيقاف البيانات الاقتصادية\n"
+            "`تحليل on/off` — تشغيل/إيقاف قناة التحليل\n"
+            "`مجدول on/off` — تشغيل/إيقاف طابور النشر المجدول\n"
+            "`موجز on/off` — تشغيل/إيقاف موجز الساعة\n"
+            "`موجز الآن` — إنشاء موجز يدويًا\n"
+            "`نشر التالي` — نشر أول عنصر في المكدس فورًا\n\n"
+
+            "⚙️ **التحكم الدقيق بالإعدادات**\n"
+            "`إعدادات` — عرض كل القيم الحالية\n"
+            "`إعداد مشاهدات الفوري 50` — لا يعتبر الفوري جاهزًا قبل 50 مشاهدة\n"
+            "`إعداد مهلة الفوري 10m` — نشر الفوري بعد 10 دقائق كحد أقصى\n"
+            "`إعداد مشاهدات التالي 800` — انتظار 800 مشاهدة قبل المنشور التالي\n"
+            "`إعداد فاصل النشر 10s` — تأخير بين المنشورات\n"
+            "`إعداد فحص المشاهدات 60s` — تكرار فحص المشاهدات\n"
+            "`إعداد فاصل التحليل 15m` — أقل مدة بين منشورات التحليل\n"
+            "`إعداد حد الموجز 120` — الحد الأقصى لكلمات موجز الساعة\n"
+            "💡 المدد تقبل `s` ثوانٍ، `m` دقائق، `h` ساعات.\n"
+            "💾 الإعدادات تُحفظ تلقائيًا في ملف runtime وتبقى بعد إعادة التشغيل.\n\n"
+
+            "📊 **المراقبة**\n"
+            "`حالة` — حالة التشغيل والطوابير\n"
+            "`إعدادات` — تفاصيل إعدادات النشر\n"
+            "`مفاتيح` — حالة مفاتيح AI\n"
+            "`مكدس` — محتوى الطوابير\n"
+            "`إحصاء` — إحصاءات النشر واستخدام AI\n"
+            "`قنوات` — القنوات المرتبطة\n\n"
+
+            "🧹 **الصيانة والاختبار**\n"
+            "`مسح المخزن` — تفريغ الطوابير\n"
+            "`إعادة تعيين` — مسح سجل منع التكرار المؤقت\n"
+            "`وضع تجربة on/off` — اختبار دون نشر فعلي\n"
+            "`حفظ الإعدادات` — حفظ الإعدادات يدويًا\n\n"
+
+            "🧪 **أمثلة عملية**\n"
+            "• رفع سرعة الفوري: `إعداد مشاهدات الفوري 10` + `إعداد مهلة الفوري 3m`\n"
+            "• جعل النشر أكثر تحفظًا: `إعداد مشاهدات التالي 1500`\n"
+            "• تقليل ضغط Telegram: `إعداد فاصل النشر 30s`\n"
+            "• تحليل كل 30 دقيقة: `إعداد فاصل التحليل 30m`\n\n"
+
+            "🌐 جميع الأوامر الأساسية تعمل بالعربية والإنجليزية."
         )
         await event.reply(help_msg)
-    else:
-        quick_help = (
-            "🔍 **أمر غير معروف**\n\n"
-            "🛠️ الأوامر الأساسية:\n"
-            "• `تفعيل` / `ايقاف`\n"
-            "• `اقتصادي on` / `off`\n"
-            "• `نشر فوري on` / `off`\n"
-            "• `تحليل on` / `off`\n"
-            "• `مجدول on` / `off`\n"
-            "• `موجز on` / `off`\n"
-            "• `موجز الآن`\n\n"
-            "📌 أرسل **مساعدة** لعرض جميع الأوامر بالتفصيل."
-        )
-        await event.reply(quick_help)
+        return
+
+    # أمر غير معروف
+    await event.reply(
+        "❓ **أمر غير معروف | Unknown Command**\n\n"
+        "🇸🇦 أرسل `مساعدة` لعرض الأوامر.\n"
+        "🇬🇧 Send `help` to show all commands."
+    )
 
 # ---------------- معالجة المصادر ----------------
 async def handle_source(event, emoji):
@@ -695,7 +1053,6 @@ async def handle_hourly_source(event):
         logging.info(f"🕗 أُضيفت رسالة إلى مكدس موجز الساعة ID={message.id}")
 
 # ---------------- القناة التحليلية ----------------
-ANALYST_POST_INTERVAL = 900
 analyst_last_post_time = 0
 
 async def analyst_handler(event):
@@ -739,7 +1096,7 @@ async def generate_hourly_summary(manual=False):
         "أنت محرر اقتصادي محترف في عام 2026. حيث ترمب هو رئيس اميركا"
         "لخص الأخبار التالية في موجز ساعة اقتصادي شامل بالعربية. "
         "ركز على التأثيرات الرئيسية، المؤشرات، وتصريحات المسؤولين. "
-        "اجعله جذابًا ومختصرًا (لا يتجاوز 120 كلمة). "
+        f"اجعله جذابًا ومختصرًا (لا يتجاوز {HOURLY_MAX_WORDS} كلمة). "
         "ابدأ بعنوان جذاب مثل: '📊 موجز الساعة الاقتصادية'."
     )
     
@@ -787,7 +1144,7 @@ async def publisher():
                 last_post = await client.get_messages(TARGET_CHANNEL_ID, ids=last_post_id)
                 views = last_post.views or 0
                 while views < MIN_VIEWS_FOR_NEXT:
-                    await asyncio.sleep(60)
+                    await asyncio.sleep(VIEW_CHECK_INTERVAL)
                     last_post = await client.get_messages(TARGET_CHANNEL_ID, ids=last_post_id)
                     views = last_post.views or 0
             except Exception:
@@ -797,53 +1154,75 @@ async def publisher():
         sent = await forward_or_send(event.message, final_text, "نشر مجدول")
         if sent:
             last_post_id = sent.id
-        await asyncio.sleep(10)
+        await asyncio.sleep(PUBLISHER_DELAY)
 
-# ---------------- التشغيل ----------------
+# ---------------- حلقة التشغيل الرئيسية المستمرة ----------------
 async def main():
     global SOURCE_CHANNEL_ID, SOURCE_CHANNEL_2_ID, TARGET_CHANNEL_ID, ANALYST_TARGET_ID, ANALYST_SOURCE_ID, CONTROL_CHANNEL_ID, HOURLY_SOURCE_ID, HOURLY_TARGET_ID
     
-    await client.start()
-    me = await client.get_me()
-    logging.info(f"✅ تسجيل الدخول باسم: {me.first_name}")
-    
-    try:
-        CONTROL_CHANNEL_ID = await resolve_channel(CONTROL_CHANNEL)
-        SOURCE_CHANNEL_ID = await resolve_channel(SOURCE_CHANNEL)
-        SOURCE_CHANNEL_2_ID = await resolve_channel(SOURCE_CHANNEL_2)
-        TARGET_CHANNEL_ID = await resolve_channel(TARGET_CHANNEL)
-        if ANALYST_SOURCE:
-            ANALYST_SOURCE_ID = await resolve_channel(ANALYST_SOURCE)
-        if ANALYST_TARGET:
-            ANALYST_TARGET_ID = await resolve_channel(ANALYST_TARGET)
-        if HOURLY_SOURCE:
-            HOURLY_SOURCE_ID = await resolve_channel(HOURLY_SOURCE)
-        if HOURLY_TARGET:
-            HOURLY_TARGET_ID = await resolve_channel(HOURLY_TARGET)
-        
-        logging.info(f"✅ القنوات جاهزة: تحكم={CONTROL_CHANNEL_ID}")
-    except Exception as e:
-        logging.critical(f"❌ فشل تهيئة القنوات: {e}")
-        return
-    
-    client.add_event_handler(control_handler, events.NewMessage(chats=[CONTROL_CHANNEL_ID]))
-    client.add_event_handler(lambda e: handle_source(e, EMOJI_IMMEDIATE), events.NewMessage(chats=[SOURCE_CHANNEL_ID]))
-    client.add_event_handler(lambda e: handle_source(e, EMOJI_SCHEDULED), events.NewMessage(chats=[SOURCE_CHANNEL_2_ID]))
-    
-    if ANALYST_SOURCE_ID and ANALYST_TARGET_ID:
-        client.add_event_handler(analyst_handler, events.NewMessage(chats=[ANALYST_SOURCE_ID]))
-    
-    if HOURLY_SOURCE_ID:
-        client.add_event_handler(handle_hourly_source, events.NewMessage(chats=[HOURLY_SOURCE_ID]))
+    handlers_registered = False
+    background_tasks_started = False
 
-    logging.info("🤖 EcoPulse Bot جاهز — في انتظار الأوامر في قناة التحكم.")
-    await asyncio.gather(publisher(), hourly_scheduler(), client.run_until_disconnected())
+    while True:
+        try:
+            if not client.is_connected():
+                await client.start()
+            
+            me = await client.get_me()
+            logging.info(f"✅ تسجيل الدخول باسم: {me.first_name}")
+            
+            # تسجيل المستمعات (Handlers) مرة واحدة فقط
+            if not handlers_registered:
+                CONTROL_CHANNEL_ID = await resolve_channel(CONTROL_CHANNEL)
+                SOURCE_CHANNEL_ID = await resolve_channel(SOURCE_CHANNEL)
+                SOURCE_CHANNEL_2_ID = await resolve_channel(SOURCE_CHANNEL_2)
+                TARGET_CHANNEL_ID = await resolve_channel(TARGET_CHANNEL)
+                if ANALYST_SOURCE:
+                    ANALYST_SOURCE_ID = await resolve_channel(ANALYST_SOURCE)
+                if ANALYST_TARGET:
+                    ANALYST_TARGET_ID = await resolve_channel(ANALYST_TARGET)
+                if HOURLY_SOURCE:
+                    HOURLY_SOURCE_ID = await resolve_channel(HOURLY_SOURCE)
+                if HOURLY_TARGET:
+                    HOURLY_TARGET_ID = await resolve_channel(HOURLY_TARGET)
+                
+                logging.info(f"✅ القنوات جاهزة: تحكم={CONTROL_CHANNEL_ID}")
+
+                client.add_event_handler(control_handler, events.NewMessage(chats=[CONTROL_CHANNEL_ID]))
+                client.add_event_handler(lambda e: handle_source(e, EMOJI_IMMEDIATE), events.NewMessage(chats=[SOURCE_CHANNEL_ID]))
+                client.add_event_handler(lambda e: handle_source(e, EMOJI_SCHEDULED), events.NewMessage(chats=[SOURCE_CHANNEL_2_ID]))
+                
+                if ANALYST_SOURCE_ID and ANALYST_TARGET_ID:
+                    client.add_event_handler(analyst_handler, events.NewMessage(chats=[ANALYST_SOURCE_ID]))
+                
+                if HOURLY_SOURCE_ID:
+                    client.add_event_handler(handle_hourly_source, events.NewMessage(chats=[HOURLY_SOURCE_ID]))
+
+                handlers_registered = True
+
+            # تشغيل المهام الخلفية (المجدول) مرة واحدة فقط في الخلفية بشكل آمن
+            if not background_tasks_started:
+                asyncio.create_task(publisher())
+                asyncio.create_task(hourly_scheduler())
+                background_tasks_started = True
+
+            logging.info("🤖 EcoPulse Bot جاهز ومستقر — في انتظار الأوامر والبيانات...")
+            
+            # سيبقى البوت يعمل هنا طالما الاتصال مستقر
+            await client.run_until_disconnected()
+            
+            # في حال توقف الاتصال وخروج run_until_disconnected
+            logging.warning("⚠️ تم فصل الاتصال بالشبكة. جاري محاولة إعادة الاتصال بعد 5 دقائق (300 ثانية)...")
+            await asyncio.sleep(30)
+
+        except Exception as e:
+            # التقاط أي أخطاء حرجة أو Timeouts لضمان بقاء السكربت حياً
+            logging.error(f"❌ حدث خطأ غير متوقع أدى لفصل البوت: {e}")
+            logging.info("⏳ جاري الانتظار لمدة 5 دقائق قبل إعادة التشغيل التلقائي...")
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("🛑 تم إيقاف البوت يدوياً.")
-    except Exception as e:
-        logging.critical(f"💥 خطأ فادح: {e}", exc_info=True)
-
+        logging.info("🛑 تم إيقاف البوت يدوياً عن طريق المستخدم.")
