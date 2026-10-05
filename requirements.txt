@@ -1,5 +1,5 @@
 telethon
 deep-translator
 python-dotenv
-google-generativeai
 openai
+google-genai  # ← اسم المكتبة الجديدة
