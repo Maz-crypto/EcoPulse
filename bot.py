@@ -407,7 +407,7 @@ async def call_gemini(prompt: str, user_content: str, max_retries=3):
             full_prompt = f"{prompt}\n\nالمحتوى:\n{user_content}"
 
             response = await client_gemini.aio.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-3.8-flash",
                 contents=full_prompt
             )
 
